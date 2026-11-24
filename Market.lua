@@ -1,0 +1,386 @@
+local _, ns = ...
+local L = ns.L
+
+-- Prices read from the auction house itself, scanned only when the player asks for
+-- it. One request replicates every auction of the realm, which the game allows
+-- every 15 minutes. Each item keeps its lowest buyout per unit and the quantity on
+-- sale, and the items the account deals in also keep one price a day, for the trend.
+local Market = {}
+ns.Market = Market
+
+local SCAN_INTERVAL_SECONDS = 15 * 60
+local ANSWER_TIMEOUT_SECONDS = 60
+local AUCTIONATOR_DELAY_SECONDS = 1
+local ENTRIES_PER_FRAME = 2000
+local KEEP_DAYS = 30
+local CHANGE_MIN_DAYS = 7
+-- The fewest daily prices an item's usual price is read from.
+local USUAL_MIN_DAYS = 3
+local SECONDS_PER_DAY = 86400
+local SOLD = 1
+-- Every caged pet shares this item, so its lowest price says nothing about any of them.
+local PET_CAGE_ITEM_ID = 82800
+
+-- Positions in a saved price: a realm holds tens of thousands of them.
+local PRICE, QUANTITY, SEEN = 1, 2, 3
+
+local auctionHouseOpen = false
+local state = nil -- nil, "waiting" for the server or "reading" its answer
+local scan = nil
+local realmKey = nil
+local realmGroup = nil
+-- Sends a scan request the throttle held back. Defined with the scanning below.
+local SendRequest
+
+-- Realm names as the client normalizes them, without spaces or dashes, so that a
+-- character key's realm compares with the list of connected realms.
+local function NormalizeRealm(realm)
+    return (realm:gsub("[%s%-]", ""))
+end
+
+-- Connected realms share one auction house, so they share their prices. The list
+-- may leave the player's own realm out, which is added so that every realm of the
+-- group finds the same key.
+local function LoadRealmGroup()
+    if realmKey then
+        return
+    end
+    local realms = { NormalizeRealm(GetNormalizedRealmName() or GetRealmName()) }
+    for _, realm in ipairs(GetAutoCompleteRealms()) do
+        table.insert(realms, NormalizeRealm(realm))
+    end
+    table.sort(realms)
+    realmKey = realms[1]
+    realmGroup = {}
+    for _, realm in ipairs(realms) do
+        realmGroup[realm] = true
+    end
+end
+
+-- Whether a character, from its key, sells on this realm's auction house.
+function Market.SharesAuctionHouse(characterKey)
+    local realm = characterKey and characterKey:match("^[^-]+%-(.+)$")
+    if not realm then
+        return false
+    end
+    LoadRealmGroup()
+    return realmGroup[NormalizeRealm(realm)] == true
+end
+
+local function RealmData(create)
+    LoadRealmGroup()
+    local realms = ns.db.market.realms
+    if not realms[realmKey] and create then
+        realms[realmKey] = { items = {}, history = {} }
+    end
+    return realms[realmKey]
+end
+
+-- Prices ----------------------------------------------------------------------------
+
+-- { price, quantity, seenAt, scannedAt } for an item of this realm's auction house,
+-- or nil when no scan ever saw it. quantity is what is on sale since the latest scan.
+function Market.GetItem(itemID)
+    local data = RealmData()
+    local saved = data and data.items[itemID]
+    if not saved then
+        return nil
+    end
+    local current = saved[SEEN] >= data.scannedAt
+    return {
+        price = saved[PRICE],
+        quantity = current and saved[QUANTITY] or 0,
+        seenAt = saved[SEEN],
+        scannedAt = data.scannedAt,
+    }
+end
+
+-- The lowest price known to be on sale now, as { price, source }, source being
+-- "scan" or "auctionator", or nil. A scan made today is the most complete answer.
+-- Otherwise Auctionator counts for what it saw today, and only knows the day.
+function Market.GetOffer(itemID)
+    local market = Market.GetItem(itemID)
+    local scanned = market and market.quantity > 0 and { price = market.price, source = "scan" } or nil
+    if scanned and ns.DayKey(market.scannedAt) == ns.DayKey(time()) then
+        return scanned
+    end
+    if ns.Stats.GetAuctionatorAge(itemID) == 0 then
+        local price = ns.Stats.GetAuctionatorPrice(itemID)
+        if price then
+            return { price = price, source = "auctionator" }
+        end
+    end
+    return scanned
+end
+
+-- When this realm's auction house was last scanned, or nil.
+function Market.GetScannedAt()
+    local data = RealmData()
+    return data and data.scannedAt
+end
+
+-- The change of the current price against the latest daily price at least a week
+-- old, and that day's time. Nil without such a price, or when the item is no longer
+-- on sale.
+function Market.GetChange(itemID)
+    local data = RealmData()
+    local saved = data and data.items[itemID]
+    local history = data and data.history[itemID]
+    if not (saved and history) or saved[SEEN] < data.scannedAt then
+        return nil
+    end
+    local limit = ns.DayKey(time() - CHANGE_MIN_DAYS * SECONDS_PER_DAY)
+    local referenceDay = nil
+    for day in pairs(history) do
+        if day <= limit and (not referenceDay or day > referenceDay) then
+            referenceDay = day
+        end
+    end
+    if not referenceDay then
+        return nil
+    end
+    local reference = history[referenceDay]
+    return (saved[PRICE] - reference) / reference, ns.DayKeyToTime(referenceDay)
+end
+
+-- The average of an item's daily prices over the month they are kept, or nil with
+-- fewer than a few of them.
+function Market.GetUsualPrice(itemID)
+    local data = RealmData()
+    local history = data and data.history[itemID]
+    if not history then
+        return nil
+    end
+    local total, days = 0, 0
+    for _, price in pairs(history) do
+        total = total + price
+        days = days + 1
+    end
+    return days >= USUAL_MIN_DAYS and total / days or nil
+end
+
+-- Queries ---------------------------------------------------------------------------
+
+-- The server loses a search sent too soon: one waits here for its turn, and the
+-- latest replaces it.
+local query = nil
+
+local function SendQuery()
+    if query and not query.sent and C_AuctionHouse.IsThrottledMessageSystemReady() then
+        query.sent = true
+        query.send()
+    end
+end
+
+function Market.SendQuery(send)
+    query = { send = send }
+    SendQuery()
+end
+
+function Market.CancelQuery()
+    query = nil
+end
+
+ns.OnEvent("AUCTION_HOUSE_THROTTLED_SYSTEM_READY", function()
+    SendQuery()
+    SendRequest()
+end)
+
+-- A search or a scan request the server dropped is sent again when it can take one.
+-- The event does not say which message it dropped: a scan request sent twice is
+-- answered once.
+ns.OnEvent("AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED", function()
+    if query then
+        query.sent = false
+    end
+    if state == "waiting" and scan.sentAt then
+        scan.sentAt = nil
+        ns.db.market.requestedAt = scan.previousRequestedAt
+    end
+end)
+
+-- Scanning --------------------------------------------------------------------------
+
+local function Prune(data, now)
+    local oldest = now - KEEP_DAYS * SECONDS_PER_DAY
+    for itemID, saved in pairs(data.items) do
+        if saved[SEEN] < oldest then
+            data.items[itemID] = nil
+        end
+    end
+    local oldestDay = ns.DayKey(oldest)
+    for itemID, history in pairs(data.history) do
+        for day in pairs(history) do
+            if day < oldestDay then
+                history[day] = nil
+            end
+        end
+        if next(history) == nil then
+            data.history[itemID] = nil
+        end
+    end
+end
+
+local function Finish()
+    local now = time()
+    local data = RealmData(true)
+    local today = ns.DayKey(now)
+    local count = 0
+    for itemID, item in pairs(scan.items) do
+        item[PRICE] = math.floor(item[PRICE] + 0.5)
+        item[SEEN] = now
+        data.items[itemID] = item
+        if ns.db.items[itemID] then
+            data.history[itemID] = data.history[itemID] or {}
+            data.history[itemID][today] = item[PRICE]
+        end
+        count = count + 1
+    end
+    data.scannedAt = now
+    Prune(data, now)
+    state, scan = nil, nil
+    ns.Print(L["Auction house scanned: %s items priced."]:format(BreakUpLargeNumbers(count)))
+    ns.Publish("MARKET_CHANGED")
+end
+
+-- A few thousand auctions a frame, so that the game does not freeze.
+local ReadSome
+
+local function ReadBatch()
+    local last = math.min(scan.index + ENTRIES_PER_FRAME, scan.total) - 1
+    for index = scan.index, last do
+        local _, _, count, _, _, _, _, _, _, buyout, _, _, _, _, _, saleStatus, itemID =
+            C_AuctionHouse.GetReplicateItemInfo(index)
+        -- Auctions without a buyout only take bids, and give no price.
+        if itemID and itemID ~= PET_CAGE_ITEM_ID and count and count > 0 and buyout and buyout > 0
+            and saleStatus ~= SOLD then
+            local unit = buyout / count
+            local item = scan.items[itemID]
+            if item then
+                item[PRICE] = math.min(item[PRICE], unit)
+                item[QUANTITY] = item[QUANTITY] + count
+            else
+                scan.items[itemID] = { unit, count }
+            end
+        end
+    end
+    scan.index = last + 1
+    if scan.index >= scan.total then
+        Finish()
+    else
+        C_Timer.After(0, ReadSome)
+    end
+end
+
+-- An error while reading would otherwise leave the scan "reading" until the auction
+-- house closes, with the button locked: the scan is dropped, the previous prices stay,
+-- and the error still reaches the game's error display.
+ReadSome = function()
+    if state ~= "reading" then
+        return
+    end
+    local ok, err = pcall(ReadBatch)
+    if not ok then
+        state, scan = nil, nil
+        ns.Print(L["The auction house scan failed. The previous prices are kept."])
+        error(err, 0)
+    end
+end
+
+function Market.NextScanAt()
+    return (ns.db.market.requestedAt or 0) + SCAN_INTERVAL_SECONDS
+end
+
+-- The request goes out once the game's throttled messages allow it: sent too soon,
+-- right after the owned auctions were asked for for instance, it would be lost. The
+-- 15 minutes the game wants between scans count from that moment.
+SendRequest = function()
+    if state ~= "waiting" or scan.sentAt or not C_AuctionHouse.IsThrottledMessageSystemReady() then
+        return
+    end
+    scan.sentAt = time()
+    ns.db.market.requestedAt = scan.sentAt
+    C_AuctionHouse.ReplicateItems()
+end
+
+-- A request the server never answered was dropped, or refused as another addon scanned
+-- less than 15 minutes ago. Its wait is given back, so the button can try again, and
+-- the player hears of it rather than waiting for nothing.
+local function ExpireUnanswered()
+    if state == "waiting" and scan.sentAt and time() - scan.sentAt > ANSWER_TIMEOUT_SECONDS then
+        ns.db.market.requestedAt = scan.previousRequestedAt
+        state, scan = nil, nil
+        ns.Print(L["The auction house did not answer the scan, perhaps because another addon scanned it less than 15 minutes ago. You can try again."])
+        ns.Publish("MARKET_CHANGED")
+    end
+end
+
+-- nil, or "waiting" for the server's answer or "reading" it.
+function Market.GetScanState()
+    ExpireUnanswered()
+    return state
+end
+
+-- Asked for by the player, who is told what happens. Returns whether a scan was
+-- requested.
+function Market.Scan()
+    ExpireUnanswered()
+    local message = nil
+    if state then
+        message = L["Scanning the auction house..."]
+    elseif not auctionHouseOpen then
+        message = L["Open the auction house to scan it."]
+    elseif Market.NextScanAt() > time() then
+        message = L["The auction house can be scanned again in %s."]:format(
+            ns.FormatDuration(Market.NextScanAt() - time()))
+    end
+    if message then
+        ns.Print(message)
+        return false
+    end
+
+    state = "waiting"
+    scan = { previousRequestedAt = ns.db.market.requestedAt }
+    SendRequest()
+    -- Checked again once the answer is overdue, should nothing look at the state.
+    C_Timer.After(ANSWER_TIMEOUT_SECONDS + 1, ExpireUnanswered)
+    ns.Print(L["Scanning the auction house..."])
+    return true
+end
+
+ns.OnEvent("REPLICATE_ITEM_LIST_UPDATE", function()
+    if state ~= "waiting" then
+        return
+    end
+    state = "reading"
+    scan.index, scan.total, scan.items = 0, C_AuctionHouse.GetNumReplicateItems(), {}
+    ReadSome()
+end)
+
+-- Opening the auction house never scans it: only the button or /tradingessentials scan does.
+ns.OnEvent("AUCTION_HOUSE_SHOW", function()
+    auctionHouseOpen = true
+end)
+
+-- Auctionator says when its prices change, after a scan but also after each search,
+-- so several changes in a row count as one.
+ns.OnEvent("PLAYER_LOGIN", function()
+    local api = Auctionator and Auctionator.API and Auctionator.API.v1
+    if api and api.RegisterForDBUpdate then
+        pcall(api.RegisterForDBUpdate, "TradingEssentials", function()
+            ns.Debounce("auctionatorPrices", AUCTIONATOR_DELAY_SECONDS, function()
+                ns.Publish("AUCTIONATOR_PRICES_CHANGED")
+            end)
+        end)
+    end
+end)
+
+-- The answer may not outlive the auction house window, so a scan in progress is
+-- dropped and the previous prices stay.
+ns.OnEvent("AUCTION_HOUSE_CLOSED", function()
+    auctionHouseOpen = false
+    if state then
+        ns.Print(L["The auction house scan stopped as the auction house closed."])
+    end
+    state, scan = nil, nil
+end)

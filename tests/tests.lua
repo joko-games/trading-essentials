@@ -1,0 +1,5463 @@
+local Mock = dofile("tests/wow_mock.lua")
+
+local output = print -- The mock replaces print to capture the addon's chat messages.
+local passed, failed = 0, 0
+local tests = {}
+
+-- Every language of the client with its own words. enUS is the keys, enGB only reorders dates.
+local LOCALES = { "deDE", "esES", "esMX", "frFR", "itIT", "koKR", "ptBR", "ruRU", "zhCN", "zhTW" }
+
+local function test(name, fn)
+    table.insert(tests, { name = name, fn = fn })
+end
+
+local function eq(actual, expected, label)
+    if actual ~= expected then
+        error((label or "value") .. ": expected " .. tostring(expected) .. ", got " .. tostring(actual), 2)
+    end
+end
+
+local function near(actual, expected, tolerance, label)
+    if math.abs(actual - expected) > tolerance then
+        error((label or "value") .. ": expected about " .. tostring(expected) .. ", got " .. tostring(actual), 2)
+    end
+end
+
+local function location(bag, slot)
+    return { bag = bag, slot = slot }
+end
+
+local function soldMail(name, bid, options)
+    options = options or {}
+    local count = options.count
+    return {
+        subject = "Auction successful: " .. name .. (count and (" (" .. count .. ")") or ""),
+        money = bid + (options.deposit or 0) - (options.cut or 0),
+        daysLeft = options.daysLeft or 30,
+        invoice = {
+            type = "seller", name = name, player = options.buyer, bid = bid, buyout = bid,
+            deposit = options.deposit or 0, consignment = options.cut or 0, count = count,
+            needsBody = options.needsBody,
+        },
+    }
+end
+
+local function kinds(ledger)
+    local names = {}
+    for _, entry in ipairs(ledger) do
+        table.insert(names, entry.kind)
+    end
+    return table.concat(names, ",")
+end
+
+-- Listings ------------------------------------------------------------------
+
+test("a commodity listing is recorded only once the server creates it", function()
+    local _ = Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 200)
+    C_AuctionHouse.PostCommodity(location(0, 1), 2, 50, 3000)
+    eq(#TradingEssentialsDB.ledger, 0, "before creation")
+
+    Mock.Fire("AUCTION_HOUSE_AUCTION_CREATED", 555)
+    eq(#TradingEssentialsDB.ledger, 1, "after creation")
+    local entry = TradingEssentialsDB.ledger[1]
+    eq(entry.kind, "post")
+    eq(entry.itemID, 1001)
+    eq(entry.qty, 50)
+    eq(entry.unit, 3000)
+    eq(entry.deposit, 500)
+    eq(entry.char, "Primo-Hyjal")
+end)
+
+test("posting several items at once records one listing with the full quantity", function()
+    Mock.Boot()
+    Mock.SetBagItem(0, 1, 2001, "Sword", 1)
+    C_AuctionHouse.PostItem(location(0, 1), 3, 3, nil, 90000)
+    Mock.Fire("AUCTION_HOUSE_AUCTION_CREATED", 1)
+    Mock.Fire("AUCTION_HOUSE_AUCTION_CREATED", 2)
+    Mock.Fire("AUCTION_HOUSE_AUCTION_CREATED", 3)
+    eq(#TradingEssentialsDB.ledger, 1)
+    eq(TradingEssentialsDB.ledger[1].qty, 3)
+    eq(TradingEssentialsDB.ledger[1].deposit, 300)
+end)
+
+test("backing out of a price warning records nothing", function()
+    Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    C_AuctionHouse.PostCommodity(location(0, 1), 1, 10, 3000)
+    C_AuctionHouse.CancelSell()
+    Mock.Fire("AUCTION_HOUSE_AUCTION_CREATED", 9)
+    eq(#TradingEssentialsDB.ledger, 0)
+end)
+
+test("a confirmed price warning records the listing once", function()
+    Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    C_AuctionHouse.PostCommodity(location(0, 1), 1, 10, 3000)
+    C_AuctionHouse.ConfirmPostCommodity(location(0, 1), 1, 10, 3000)
+    Mock.Fire("AUCTION_HOUSE_AUCTION_CREATED", 9)
+    eq(#TradingEssentialsDB.ledger, 1)
+end)
+
+test("a refused listing does not attach to the next one", function()
+    Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(0, 2, 1002, "Ore", 10)
+    C_AuctionHouse.PostCommodity(location(0, 1), 1, 10, 3000)
+    Mock.Fire("AUCTION_HOUSE_SHOW_ERROR", 1)
+    C_AuctionHouse.PostCommodity(location(0, 2), 1, 5, 700)
+    Mock.Fire("AUCTION_HOUSE_AUCTION_CREATED", 9)
+    eq(#TradingEssentialsDB.ledger, 1)
+    eq(TradingEssentialsDB.ledger[1].itemID, 1002)
+end)
+
+test("a listing that never completes expires instead of matching a later one", function()
+    local _, world = Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    C_AuctionHouse.PostCommodity(location(0, 1), 1, 10, 3000)
+    world.now = world.now + 120
+    Mock.Fire("AUCTION_HOUSE_AUCTION_CREATED", 9)
+    eq(#TradingEssentialsDB.ledger, 0)
+end)
+
+-- Cancellations and owned auctions -------------------------------------------
+
+test("a cancellation records its cost and item, and ends the auction", function()
+    local ns, world = Mock.Boot()
+    world.owned = { { auctionID = 77, itemKey = { itemID = 2001 }, itemLink = "|Hitem:2001|h[Sword]|h",
+        status = 0, quantity = 1, timeLeftSeconds = 3600, buyoutAmount = 90000 } }
+    Mock.Fire("OWNED_AUCTIONS_UPDATED")
+    eq(#ns.Auctions.GetAll(), 1)
+
+    world.cancelCosts[77] = 450
+    C_AuctionHouse.CancelAuction(77)
+    eq(#TradingEssentialsDB.ledger, 0, "before server confirmation")
+    Mock.Fire("AUCTION_CANCELED", 77)
+
+    local entry = TradingEssentialsDB.ledger[1]
+    eq(entry.kind, "cancel")
+    eq(entry.cost, 450)
+    eq(entry.name, "Sword")
+    eq(#ns.Auctions.GetAll(), 0)
+end)
+
+test("owned auctions are requested when the auction house opens, once it has settled", function()
+    local _, world = Mock.Boot()
+    Mock.Fire("AUCTION_HOUSE_SHOW")
+    eq(world.ownedQueries, 0, "not immediately")
+    Mock.RunTimers()
+    eq(world.ownedQueries, 1)
+
+    Mock.Fire("AUCTION_HOUSE_SHOW")
+    Mock.Fire("AUCTION_HOUSE_CLOSED")
+    Mock.RunTimers()
+    eq(world.ownedQueries, 1, "not after closing")
+end)
+
+test("ended auctions stop counting as live", function()
+    local ns, world = Mock.Boot()
+    world.owned = { { auctionID = 1, itemKey = { itemID = 1001 }, status = 0, quantity = 5, timeLeftSeconds = 60, buyoutAmount = 10 } }
+    Mock.Fire("OWNED_AUCTIONS_UPDATED")
+    eq(#ns.Auctions.GetAll(), 1)
+    world.now = world.now + 61
+    eq(#ns.Auctions.GetAll(), 0)
+end)
+
+-- Mail ----------------------------------------------------------------------
+
+test("a sale takes its amounts and buyer from the invoice", function()
+    local ns, world = Mock.Boot()
+    ns.RememberItem(1001, "Herb")
+    world.mails = { soldMail("Herb", 100000, { cut = 5000, deposit = 200, count = 20, buyer = "Bob" }) }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxMoney(1)
+    local entry = TradingEssentialsDB.ledger[1]
+    eq(entry.kind, "sold")
+    eq(entry.itemID, 1001)
+    eq(entry.qty, 20)
+    eq(entry.gross, 100000)
+    eq(entry.cut, 5000)
+    eq(entry.deposit, 200)
+    eq(entry.other, "Bob")
+    eq(ns.Stats.Net(entry), 100000 + 200 - 5000)
+end)
+
+test("a sale is dated from the mail's remaining lifetime, not its collection", function()
+    local _, world = Mock.Boot()
+    world.mails = { soldMail("Herb", 100, { daysLeft = 27 }) }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxMoney(1)
+    eq(TradingEssentialsDB.ledger[1].t, world.now - 3 * 86400)
+end)
+
+test("identical mails are all recorded when collected in a row", function()
+    local _, world = Mock.Boot()
+    for _ = 1, 3 do
+        table.insert(world.mails, soldMail("Herb", 100, { cut = 5 }))
+    end
+    Mock.Fire("MAIL_SHOW")
+    for _ = 1, 3 do
+        TakeInboxMoney(1)
+        Mock.CompleteTake()
+    end
+    eq(#TradingEssentialsDB.ledger, 3)
+    eq(#world.mails, 0)
+end)
+
+test("collecting the same mail twice before the server answers counts once", function()
+    local _, world = Mock.Boot()
+    world.mails = { soldMail("Herb", 100), soldMail("Ore", 200) }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxMoney(1)
+    TakeInboxMoney(1)
+    Mock.Fire("MAIL_INBOX_UPDATE") -- Unrelated refresh, mail still there.
+    TakeInboxMoney(1)
+    eq(#TradingEssentialsDB.ledger, 1)
+end)
+
+test("an expired auction with several attachments counts once, with their total", function()
+    local _, world = Mock.Boot()
+    world.mails = { {
+        subject = "Auction expired: Herb",
+        items = {
+            { name = "Herb", id = 1001, count = 200, link = "|Hitem:1001|h[Herb]|h" },
+            { name = "Herb", id = 1001, count = 50, link = "|Hitem:1001|h[Herb]|h" },
+        },
+    } }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxItem(1, 2)
+    Mock.CompleteTake()
+    TakeInboxItem(1, 1)
+    Mock.CompleteTake()
+    eq(kinds(TradingEssentialsDB.ledger), "expired")
+    eq(TradingEssentialsDB.ledger[1].qty, 250)
+    eq(TradingEssentialsDB.ledger[1].itemID, 1001)
+end)
+
+test("a purchase uses the invoice price and the attached item", function()
+    local _, world = Mock.Boot()
+    world.mails = { {
+        subject = "Auction won: Herb (20)",
+        items = { { name = "Herb", id = 1001, count = 20, link = "|Hitem:1001|h[Herb]|h" } },
+        invoice = { type = "buyer", name = "Herb", player = "Alice", bid = 60000, buyout = 60000, deposit = 0, consignment = 0, count = 20, commodity = true },
+    } }
+    Mock.Fire("MAIL_SHOW")
+    AutoLootMailItem(1)
+    local entry = TradingEssentialsDB.ledger[1]
+    eq(entry.kind, "bought")
+    eq(entry.gross, 60000)
+    eq(entry.qty, 20)
+    eq(entry.itemID, 1001)
+    eq(entry.other, "Alice")
+end)
+
+test("a purchase whose invoice cannot be read has an unknown price, left out of the totals", function()
+    local ns, world = Mock.Boot()
+    world.mails = { {
+        subject = "Auction won: Herb (20)",
+        items = { { name = "Herb", id = 1001, count = 20, link = "|Hitem:1001|h[Herb]|h" } },
+    } }
+    Mock.Fire("MAIL_SHOW")
+    AutoLootMailItem(1)
+    local entry = TradingEssentialsDB.ledger[1]
+    eq(entry.kind, "bought")
+    eq(entry.gross, nil, "not zero")
+    eq(entry.qty, 20)
+    eq(ns.Ledger.IsPriceUnknown(entry), true)
+    eq(ns.Ledger.UnitPrice(entry), nil)
+    eq(ns.Ledger.Amount(entry), nil)
+
+    ns.Ledger.Add({ kind = "bought", itemID = 1001, name = "Herb", qty = 10, gross = 500 })
+    eq(ns.Ledger.IsPriceUnknown(TradingEssentialsDB.ledger[2]), false)
+    local summary = ns.Stats.Summarize()
+    eq(summary.spent, 500)
+    eq(summary.net, -500)
+    eq(summary.unpricedPurchases, 1)
+    eq(summary.items[1001].boughtQty, 30, "every unit bought")
+    eq(summary.items[1001].pricedBoughtQty, 10, "only the units with a price")
+end)
+
+test("collection failing on full bags can be retried without double counting", function()
+    local _, world = Mock.Boot()
+    world.mails = { {
+        subject = "Auction expired: Herb",
+        items = { { name = "Herb", id = 1001, count = 20 } },
+    }, soldMail("Ore", 100) }
+    Mock.Fire("MAIL_SHOW")
+
+    AutoLootMailItem(1)
+    eq(#TradingEssentialsDB.ledger, 1, "recorded on take")
+    Mock.FailTake()
+    eq(#TradingEssentialsDB.ledger, 0, "undone on failure")
+
+    AutoLootMailItem(1)
+    Mock.CompleteTake()
+    eq(kinds(TradingEssentialsDB.ledger), "expired")
+end)
+
+test("a failure after a successful take does not undo that take", function()
+    local _, world = Mock.Boot()
+    world.mails = { soldMail("Herb", 100), soldMail("Ore", 200) }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxMoney(1)
+    Mock.CompleteTake()
+    Mock.Fire("MAIL_FAILED", 0) -- Say, a mail being sent bounces.
+    eq(#TradingEssentialsDB.ledger, 1)
+end)
+
+test("a failure after a successful partial take does not undo the expiry", function()
+    local _, world = Mock.Boot()
+    world.mails = { {
+        subject = "Auction expired: Herb",
+        items = { { name = "Herb", id = 1001, count = 200 }, { name = "Herb", id = 1001, count = 50 } },
+    } }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxItem(1, 2)
+    Mock.CompleteTake() -- The mail stays: only MAIL_SUCCESS tells the take worked.
+    Mock.Fire("MAIL_FAILED", 0)
+    eq(#TradingEssentialsDB.ledger, 1)
+end)
+
+test("a mail leaving the inbox counts as taken even without a success event", function()
+    local _, world = Mock.Boot()
+    world.mails = { soldMail("Herb", 100), soldMail("Ore", 200) }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxMoney(1)
+    table.remove(world.mails, 1)
+    Mock.Fire("MAIL_INBOX_UPDATE")
+    Mock.Fire("MAIL_FAILED", 0)
+    eq(#TradingEssentialsDB.ledger, 1)
+end)
+
+test("a pending sale notice and ordinary mail are not recorded", function()
+    local _, world = Mock.Boot()
+    world.mails = {
+        { subject = "Sale pending: Herb", invoice = { type = "seller_temp_invoice", name = "Herb", bid = 100, deposit = 0, consignment = 5 } },
+        { subject = "Hello from a friend", money = 500 },
+    }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxMoney(2)
+    TakeInboxMoney(1)
+    eq(#TradingEssentialsDB.ledger, 0)
+end)
+
+test("an invoice is trusted even when the subject line is not recognised", function()
+    local _, world = Mock.Boot()
+    local mail = soldMail("Herb", 100, { cut = 5 })
+    mail.subject = "A subject in another wording"
+    world.mails = { mail }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxMoney(1)
+    eq(kinds(TradingEssentialsDB.ledger), "sold")
+    eq(TradingEssentialsDB.ledger[1].cut, 5)
+end)
+
+test("an invoice needing the mail body is read at collection, not while scanning", function()
+    local _, world = Mock.Boot()
+    world.mails = { soldMail("Herb", 100, { cut = 5, needsBody = true }) }
+    Mock.Fire("MAIL_SHOW")
+    Mock.Fire("MAIL_INBOX_UPDATE")
+    eq(world.bodiesLoaded, 0, "scanning must not mark mail as read")
+    TakeInboxMoney(1)
+    eq(world.bodiesLoaded, 1)
+    eq(TradingEssentialsDB.ledger[1].cut, 5)
+end)
+
+test("without any invoice a sale falls back on the subject and the mail's money", function()
+    local _, world = Mock.Boot()
+    world.mails = { { subject = "Auction successful: Herb (20)", money = 950 } }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxMoney(1)
+    local entry = TradingEssentialsDB.ledger[1]
+    eq(entry.name, "Herb")
+    eq(entry.qty, 20)
+    eq(entry.gross, 950)
+end)
+
+test("subjects are recognised in French, including special characters", function()
+    local _, world = Mock.Boot({
+        locale = "frFR",
+        subjects = {
+            sold = "Vente aux enchères réussie : %s",
+            won = "Enchère remportée (HV) : %s",
+            expired = "Vente aux enchères expirée - %1$s",
+        },
+    })
+    world.mails = {
+        { subject = "Vente aux enchères réussie : Herbe (5)", money = 95 },
+        { subject = "Enchère remportée (HV) : Herbe", items = { { name = "Herbe", id = 1001, count = 1 } } },
+        { subject = "Vente aux enchères expirée - Herbe", items = { { name = "Herbe", id = 1001, count = 2 } } },
+    }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxItem(3, 1)
+    TakeInboxItem(2, 1)
+    TakeInboxMoney(1)
+    eq(kinds(TradingEssentialsDB.ledger), "expired,bought,sold")
+    eq(TradingEssentialsDB.ledger[3].qty, 5)
+end)
+
+test("a sale collected from mail ends the matching live auction", function()
+    local ns, world = Mock.Boot()
+    ns.RememberItem(1001, "Herb")
+    world.owned = { { auctionID = 1, itemKey = { itemID = 1001 }, status = 0, quantity = 50, timeLeftSeconds = 9000, buyoutAmount = 10 } }
+    Mock.Fire("OWNED_AUCTIONS_UPDATED")
+    world.mails = { soldMail("Herb", 100, { count = 20 }) }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxMoney(1)
+    eq(ns.Auctions.GetAll()[1].auction.qty, 30)
+end)
+
+test("a sale already marked sold is consumed before auctions still on sale", function()
+    local ns, world = Mock.Boot()
+    ns.RememberItem(1001, "Herb")
+    world.owned = {
+        { auctionID = 1, itemKey = { itemID = 1001 }, status = 0, quantity = 50, timeLeftSeconds = 9000, buyoutAmount = 10 },
+        { auctionID = 2, itemKey = { itemID = 1001 }, status = 1, quantity = 20, timeLeftSeconds = 3000, buyoutAmount = 10 },
+    }
+    Mock.Fire("OWNED_AUCTIONS_UPDATED")
+    world.mails = { soldMail("Herb", 100, { count = 20 }) }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxMoney(1)
+    local live = ns.Auctions.GetAll()
+    eq(#live, 1)
+    eq(live[1].auction.qty, 50)
+end)
+
+-- Stock ---------------------------------------------------------------------
+
+local function findRow(rows, itemID)
+    for _, row in ipairs(rows) do
+        if row.itemID == itemID then
+            return row
+        end
+    end
+end
+
+test("stock counts every location, and bound items apart", function()
+    local ns, world = Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(5, 1, 1001, "Herb", 5)
+    Mock.SetBagItem(1, 1, 3001, "Soulbound Ring", 1, { isBound = true })
+    Mock.SetBagItem(6, 1, 1001, "Herb", 100)
+    Mock.SetBagItem(12, 1, 1001, "Herb", 1000)
+    world.mails = { { subject = "Hi", items = { { name = "Herb", id = 1001, count = 7 } } } }
+    world.owned = { { auctionID = 1, itemKey = { itemID = 1001 }, status = 0, quantity = 40, timeLeftSeconds = 9000, buyoutAmount = 10 } }
+
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.Fire("MAIL_SHOW")
+    Mock.Fire("OWNED_AUCTIONS_UPDATED")
+    Mock.RunTimers()
+
+    local row = findRow(ns.Stockpile.GetRows(), 1001)
+    eq(row.bags, 15, "bags")
+    eq(row.bank, 100, "bank")
+    eq(row.warband, 1000, "warband")
+    eq(row.mail, 7, "mail")
+    eq(row.auctions, 40, "auctions")
+    eq(row.total, 1162, "total")
+    eq(findRow(ns.Stockpile.GetRows(), 3001), nil, "no bound item in the tradable stock")
+
+    local bound = findRow(ns.Stockpile.GetRows(nil, true), 3001)
+    eq(bound.bags, 1, "the bound item, asked for")
+    eq(bound.bound.total, 1)
+    eq(bound.bound.bags, 1)
+    eq(findRow(ns.Stockpile.GetRows(nil, true), 1001).bound.total, 0, "a tradable item has no bound units")
+end)
+
+test("bound items are counted in every bank, but leave the value and history alone", function()
+    local ns, world = Mock.Boot()
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(0, 2, 1001, "Herb", 3, { isBound = true })
+    Mock.SetBagItem(6, 1, 1001, "Herb", 4, { isBound = true })
+    Mock.SetBagItem(12, 1, 1001, "Herb", 5, { isBound = true })
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    Mock.Fire("BANKFRAME_CLOSED")
+
+    local row = ns.Stockpile.GetItemRow(1001, true)
+    eq(row.total, 22, "everything")
+    eq(row.bound.bags, 3, "bound in the bags")
+    eq(row.bound.bank, 4, "bound in the bank")
+    eq(row.bound.warband, 5, "bound in the warband bank")
+    eq(ns.Stockpile.GetItemRow(1001).total, 10, "the tradable stock alone")
+    eq(ns.Stockpile.GetValue(), 10 * 100, "only what can be sold has a value")
+    local series = TradingEssentialsDB.stockHistory[1001]
+    eq(series[#series].value, 10, "the history follows what can be sold")
+end)
+
+test("saved data from before bound items were counted reads as none", function()
+    local ns = Mock.Boot()
+    TradingEssentialsDB.characters["Alt-Hyjal"] = { money = 0, stock = { bags = { [1001] = 5 }, bank = {}, mail = {} }, auctions = {} }
+    eq(ns.Stockpile.GetItemRow(1001, true).bound.total, 0)
+end)
+
+test("bank contents are remembered when the bank is closed", function()
+    local ns = Mock.Boot()
+    Mock.SetBagItem(6, 1, 1001, "Herb", 100)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    Mock.Fire("BANKFRAME_CLOSED")
+
+    Mock.SetBagItem(6, 1, 1001, "Herb", 1) -- Would be wrong if read while closed.
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    eq(findRow(ns.Stockpile.GetRows(), 1001).bank, 100)
+end)
+
+test("an inaccessible warband bank keeps its last known contents", function()
+    local ns, world = Mock.Boot()
+    Mock.SetBagItem(12, 1, 1001, "Herb", 500)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+
+    world.canViewBank[Enum.BankType.Account] = false
+    world.bags[12] = nil
+    Mock.Fire("PLAYER_ACCOUNT_BANK_TAB_SLOTS_CHANGED", 12, 1)
+    Mock.RunTimers()
+    eq(findRow(ns.Stockpile.GetRows(), 1001).warband, 500)
+end)
+
+test("sold auctions no longer count as stock", function()
+    local ns, world = Mock.Boot()
+    world.owned = { { auctionID = 1, itemKey = { itemID = 1001 }, status = 1, quantity = 40, timeLeftSeconds = 3000, buyoutAmount = 10 } }
+    Mock.Fire("OWNED_AUCTIONS_UPDATED")
+    Mock.RunTimers()
+    eq(findRow(ns.Stockpile.GetRows(), 1001), nil)
+end)
+
+test("other characters are summed, and filtered out on request", function()
+    local ns = Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    TradingEssentialsDB.characters["Alt-Hyjal"] = { money = 777, stock = { bags = { [1001] = 5 }, bank = {}, mail = {} }, auctions = {} }
+
+    eq(findRow(ns.Stockpile.GetRows(), 1001).total, 15, "account")
+    eq(findRow(ns.Stockpile.GetRows("Primo-Hyjal"), 1001).total, 10, "filtered")
+    eq(findRow(ns.Stockpile.GetRows(), 1001).characters["Alt-Hyjal"].bags, 5, "breakdown")
+end)
+
+test("stock history keeps one point per day and only records changes", function()
+    local ns, world = Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 12)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    eq(#TradingEssentialsDB.stockHistory[1001], 1, "same day")
+    eq(TradingEssentialsDB.stockHistory[1001][1].value, 12)
+
+    world.now = world.now + 86400
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    eq(#TradingEssentialsDB.stockHistory[1001], 1, "unchanged next day")
+
+    world.now = world.now + 86400
+    world.bags[0][1] = nil
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    eq(#TradingEssentialsDB.stockHistory[1001], 2, "gone")
+    eq(TradingEssentialsDB.stockHistory[1001][2].value, 0, "recorded as zero")
+    eq(ns.Stockpile.GetChange(1001, 1), -12, "change")
+end)
+
+test("stock change is unknown before the addon was running", function()
+    local ns, world = Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    eq(ns.Stockpile.GetChange(1001, 7), nil, "too early")
+
+    world.now = world.now + 8 * 86400
+    Mock.SetBagItem(0, 1, 1001, "Herb", 25)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    eq(ns.Stockpile.GetChange(1001, 7), 15, "known")
+end)
+
+test("gold sums characters and the warband bank", function()
+    local ns, world = Mock.Boot()
+    world.money = 1000
+    world.warbandMoney = 500
+    Mock.Fire("PLAYER_MONEY")
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    TradingEssentialsDB.characters["Alt-Hyjal"] = { money = 250, stock = { bags = {}, bank = {}, mail = {} }, auctions = {} }
+    eq(ns.Stockpile.GetGold(), 1750, "account")
+    eq(ns.Stockpile.GetGold("Primo-Hyjal"), 1000, "character")
+end)
+
+-- Gold history ----------------------------------------------------------------
+
+local function dayKey(ns, world, offset)
+    return ns.DayKey(world.now + offset * 86400)
+end
+
+-- Adds a holder with a history given as { [day offset] = value }, oldest first.
+local function goldSeries(ns, world, values)
+    local series = {}
+    for _, item in ipairs(values) do
+        table.insert(series, { day = dayKey(ns, world, item[1]), value = item[2] })
+    end
+    series[1].opening = values.opening or series[1].value
+    return series
+end
+
+local function setCharacterGold(ns, world, key, values, class)
+    TradingEssentialsDB.characters[key] = {
+        class = class,
+        money = values[#values][2],
+        moneyHistory = goldSeries(ns, world, values),
+        stock = { bags = {}, bank = {}, mail = {} },
+        auctions = {},
+    }
+end
+
+local function setWarbandGold(ns, world, values)
+    TradingEssentialsDB.warband.scannedAt = world.now
+    TradingEssentialsDB.warband.money = values[#values][2]
+    TradingEssentialsDB.warband.moneyHistory = goldSeries(ns, world, values)
+end
+
+-- The player's own history, replacing what login recorded.
+local PLAYER_KEY = "Primo-Hyjal"
+
+test("each holder records its own gold, one point a day at most", function()
+    local ns, world = Mock.Boot({ money = 1000 })
+    world.money = 1500
+    Mock.Fire("PLAYER_MONEY")
+    Mock.RunTimers()
+    local history = TradingEssentialsDB.characters[PLAYER_KEY].moneyHistory
+    eq(#history, 1, "same day")
+    eq(history[1].value, 1500)
+
+    world.now = world.now + 86400
+    world.money = 2000
+    Mock.Fire("PLAYER_MONEY")
+    Mock.RunTimers()
+    eq(#history, 2, "next day")
+
+    eq(TradingEssentialsDB.warband.moneyHistory, nil, "warband not seen yet")
+    world.warbandMoney = 700
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    eq(TradingEssentialsDB.warband.moneyHistory[1].value, 700, "warband once seen")
+end)
+
+test("gains on the very first day count, against the amount held at first sight", function()
+    local ns, world = Mock.Boot({ money = 1000 })
+    world.money = 1500
+    Mock.Fire("PLAYER_MONEY")
+    Mock.RunTimers()
+    local analysis = ns.Gold.Analyze({ days = 7, char = PLAYER_KEY })
+    eq(analysis.current, 1500)
+    eq(analysis.change, 500)
+    eq(#analysis.points, 1, "only the day it has been tracked")
+    eq(analysis.points[1].delta, 500)
+end)
+
+test("the first login on an alt is not a gain", function()
+    local ns, world = Mock.Boot({ money = 1000 })
+    Mock.RunTimers()
+    world.now = world.now + 86400
+    Mock.Fire("PLAYER_MONEY")
+    Mock.RunTimers()
+    eq(ns.Gold.Analyze({ days = 7 }).change, 0, "before the alt")
+
+    setCharacterGold(ns, world, "Alt-Hyjal", { { 0, 50000 } })
+    local analysis = ns.Gold.Analyze({ days = 7 })
+    eq(analysis.current, 51000, "the alt's gold is counted")
+    eq(analysis.change, 0, "but it is no gain")
+
+    setCharacterGold(ns, world, "Alt-Hyjal", { { 0, 50500 }, opening = 50000 })
+    eq(ns.Gold.Analyze({ days = 7 }).change, 500, "what the alt earns afterwards is")
+end)
+
+test("moving gold between holders is no gain", function()
+    local ns, world = Mock.Boot({ money = 5000 })
+    setCharacterGold(ns, world, PLAYER_KEY, { { -2, 5000 }, { 0, 3000 } })
+    setWarbandGold(ns, world, { { -2, 1000 }, { 0, 3000 } })
+    eq(ns.Gold.Analyze({ days = 7 }).change, 0, "whole account")
+    eq(ns.Gold.Analyze({ days = 7, holders = "characters" }).change, -2000, "characters")
+    eq(ns.Gold.Analyze({ days = 7, holders = "warband" }).change, 2000, "warband")
+end)
+
+test("the analysis finds the best and worst days, the peak, and how days went", function()
+    local ns, world = Mock.Boot()
+    setCharacterGold(ns, world, PLAYER_KEY, { { -5, 1000 }, { -4, 1500 }, { -3, 1200 }, { -1, 2000 }, { 0, 1900 } })
+    local a = ns.Gold.Analyze({ days = 30, char = PLAYER_KEY })
+
+    eq(#a.points, 6, "starts when tracking did, not 30 days ago")
+    eq(a.current, 1900)
+    eq(a.change, 900)
+    near(a.percent, 0.9, 0.0001, "percent")
+    near(a.perDay, 150, 0.0001, "per day")
+    eq(a.best.delta, 800, "best")
+    eq(a.best.day, dayKey(ns, world, -1), "best day")
+    eq(a.worst.delta, -300, "worst")
+    eq(a.worst.day, dayKey(ns, world, -3), "worst day")
+    eq(a.peak.value, 2000, "peak")
+    eq(a.peak.day, dayKey(ns, world, -1), "peak day")
+    eq(a.upDays, 2, "days up")
+    eq(a.downDays, 2, "days down")
+    eq(a.trackedSince, dayKey(ns, world, -5))
+
+    local total = 0
+    for _, point in ipairs(a.points) do
+        total = total + point.delta
+    end
+    eq(total, a.change, "daily changes add up")
+end)
+
+test("a period measures against the day before it", function()
+    local ns, world = Mock.Boot()
+    setCharacterGold(ns, world, PLAYER_KEY, { { -5, 1000 }, { -3, 1200 }, { -1, 2000 }, { 0, 1900 } })
+    local a = ns.Gold.Analyze({ days = 2, char = PLAYER_KEY })
+    eq(#a.points, 2)
+    eq(a.change, 700, "from 1200, held two days ago")
+    eq(a.best.delta, 800)
+    eq(a.worst.delta, -100)
+end)
+
+test("a flat period has no best or worst day, and no gold has no percentage", function()
+    local ns, world = Mock.Boot()
+    setCharacterGold(ns, world, PLAYER_KEY, { { -3, 1000 } })
+    local flat = ns.Gold.Analyze({ days = 7, char = PLAYER_KEY })
+    eq(flat.best, nil)
+    eq(flat.worst, nil)
+    eq(flat.change, 0)
+
+    setCharacterGold(ns, world, PLAYER_KEY, { { -3, 0 }, { 0, 500 } })
+    eq(ns.Gold.Analyze({ days = 7, char = PLAYER_KEY }).percent, nil)
+end)
+
+test("gold can be filtered by character or kind of holder", function()
+    local ns, world = Mock.Boot()
+    setCharacterGold(ns, world, PLAYER_KEY, { { -2, 1000 }, { 0, 1100 } })
+    setCharacterGold(ns, world, "Alt-Hyjal", { { -2, 2000 }, { 0, 2200 } })
+    setWarbandGold(ns, world, { { -2, 4000 }, { 0, 4400 } })
+
+    eq(ns.Gold.Analyze({ days = 7 }).current, 7700, "all")
+    eq(ns.Gold.Analyze({ days = 7, holders = "all" }).change, 700, "all, explicit")
+    eq(ns.Gold.Analyze({ days = 7, holders = "characters" }).current, 3300, "characters")
+    eq(ns.Gold.Analyze({ days = 7, holders = "warband" }).current, 4400, "warband")
+    eq(ns.Gold.Analyze({ days = 7, char = "Alt-Hyjal" }).current, 2200, "one character")
+    eq(ns.Gold.Analyze({ days = 7, char = "Alt-Hyjal", holders = "warband" }).current, 2200, "a character wins over the holder filter")
+end)
+
+test("the warband bank is left out until it has been seen", function()
+    local ns = Mock.Boot({ money = 100 })
+    local a = ns.Gold.Analyze({ days = 7, holders = "warband" })
+    eq(#a.points, 0)
+    eq(a.current, 0)
+    eq(#ns.Gold.GetBreakdown({ days = 7, holders = "warband" }), 0)
+end)
+
+test("an old alt without history still counts for its known gold", function()
+    local ns, world = Mock.Boot({ money = 100 })
+    TradingEssentialsDB.characters["Old-Hyjal"] = { money = 900, stock = { bags = {}, bank = {}, mail = {} }, auctions = {} }
+    local a = ns.Gold.Analyze({ days = 7 })
+    eq(a.current, 1000)
+    eq(a.change, 0)
+end)
+
+test("income splits between auctions and the rest, on the same scope", function()
+    local ns, world = Mock.Boot()
+    setCharacterGold(ns, world, PLAYER_KEY, { { -2, 1000 }, { 0, 5000 } })
+    setCharacterGold(ns, world, "Alt-Hyjal", { { -2, 1000 }, { 0, 1000 } })
+    ns.Ledger.Add({ kind = "sold", itemID = 1, qty = 1, gross = 3000, cut = 150, deposit = 0, t = world.now - 86400 })
+    ns.Ledger.Add({ kind = "sold", itemID = 1, qty = 1, gross = 700, cut = 0, deposit = 0, t = world.now, char = "Alt-Hyjal" })
+
+    local all = ns.Gold.Analyze({ days = 7 })
+    eq(all.auctionNet, 2850 + 700)
+    eq(all.otherIncome, 4000 - 3550)
+
+    local one = ns.Gold.Analyze({ days = 7, char = PLAYER_KEY })
+    eq(one.auctionNet, 2850, "this character's sales only")
+    eq(one.otherIncome, 1150)
+
+    eq(ns.Gold.Analyze({ days = 7, holders = "warband" }).auctionNet, nil, "not for gold merely stored")
+    eq(ns.Gold.Analyze({ days = 7, holders = "characters" }).auctionNet, nil, "transfers would pass for income")
+end)
+
+test("long histories are shortened without losing the end or the changes", function()
+    local ns, world = Mock.Boot()
+    local values = {}
+    for offset = -199, 0 do
+        table.insert(values, { offset, 1000 + (offset + 200) * 10 + (offset % 7) * 100 })
+    end
+    setCharacterGold(ns, world, PLAYER_KEY, values)
+    local a = ns.Gold.Analyze({ days = 0, char = PLAYER_KEY })
+    eq(#a.points, 200, "all time")
+
+    local sampled = ns.Gold.Downsample(a.points, 90)
+    eq(#sampled <= 90, true, "shortened: " .. #sampled)
+    eq(sampled[#sampled].day, dayKey(ns, world, 0), "still ends today")
+    eq(sampled[#sampled].value, a.current)
+    eq(sampled[1].from, a.points[1].t, "still starts on the first day")
+    local total = 0
+    for _, point in ipairs(sampled) do
+        total = total + point.delta
+    end
+    eq(total, a.change, "changes still add up")
+
+    eq(ns.Gold.Downsample(a.points, 500), a.points, "left alone when short enough")
+end)
+
+test("the breakdown gives each holder its gold, share and change", function()
+    local ns, world = Mock.Boot()
+    setCharacterGold(ns, world, PLAYER_KEY, { { -2, 1000 }, { 0, 1500 } })
+    setCharacterGold(ns, world, "Alt-Hyjal", { { 0, 500 } })
+    setWarbandGold(ns, world, { { -2, 2000 } })
+
+    local rows = ns.Gold.GetBreakdown({ days = 7 })
+    eq(#rows, 3)
+    local byKey, share = {}, 0
+    for _, row in ipairs(rows) do
+        byKey[row.key] = row
+        share = share + row.share
+    end
+    near(share, 1, 0.0001, "shares")
+    eq(byKey[PLAYER_KEY].gold, 1500)
+    eq(byKey[PLAYER_KEY].change, 500)
+    eq(byKey["Alt-Hyjal"].change, 0, "first seen today: no gain")
+    eq(byKey.warband.isWarband, true)
+    near(byKey.warband.share, 0.5, 0.0001, "warband share")
+end)
+
+test("saved data from the first version loses its old gold total without harm", function()
+    local ns = Mock.Boot({ money = 100, db = { goldHistory = { { day = 20260101, value = 5 } } } })
+    eq(TradingEssentialsDB.goldHistory, nil)
+    eq(ns.Gold.Analyze({ days = 7 }).current, 100)
+end)
+
+-- Stats ---------------------------------------------------------------------
+
+local function seedLedger(ns, world)
+    local now = world.now
+    ns.Ledger.Add({ kind = "post", t = now - 2 * 86400, itemID = 1001, name = "Herb", qty = 100, unit = 1000, deposit = 500 })
+    ns.Ledger.Add({ kind = "sold", t = now - 1 * 86400, itemID = 1001, name = "Herb", qty = 60, gross = 60000, cut = 3000, deposit = 300 })
+    ns.Ledger.Add({ kind = "expired", t = now, itemID = 1001, name = "Herb", qty = 30 })
+    ns.Ledger.Add({ kind = "cancel", t = now, itemID = 1001, name = "Herb", qty = 10, cost = 150 })
+    ns.Ledger.Add({ kind = "bought", t = now, itemID = 2001, name = "Sword", qty = 1, gross = 20000 })
+    ns.Ledger.Add({ kind = "sold", t = now - 40 * 86400, itemID = 2001, name = "Sword", qty = 1, gross = 90000, cut = 4500, deposit = 0, char = "Alt-Hyjal" })
+end
+
+test("the summary reconciles: net equals sales minus purchases minus fees", function()
+    local ns, world = Mock.Boot()
+    seedLedger(ns, world)
+    local s = ns.Stats.Summarize({ since = ns.Stats.PeriodStart(7) })
+    eq(s.gross, 60000, "sales")
+    eq(s.spent, 20000, "purchases")
+    eq(s.fees, 3000 + (500 - 300) + 150, "fees")
+    eq(s.net, 36650, "net")
+    eq(s.net, s.gross - s.spent - s.fees, "identity")
+end)
+
+test("the net matches the actual change in the player's money", function()
+    local ns, world = Mock.Boot()
+    seedLedger(ns, world)
+    local gold = 0
+    gold = gold - 500             -- Deposit when listing.
+    gold = gold + 60000 + 300 - 3000 -- Sale mail.
+    gold = gold - 150             -- Cancellation.
+    gold = gold - 20000           -- Purchase.
+    gold = gold + 90000 - 4500    -- The alt's old sale.
+    eq(ns.Stats.Summarize().net, gold)
+end)
+
+test("sell-through is by quantity across sold, expired and cancelled", function()
+    local ns, world = Mock.Boot()
+    seedLedger(ns, world)
+    local s = ns.Stats.Summarize({ since = ns.Stats.PeriodStart(7) })
+    near(s.sellThrough, 60 / 100, 0.0001, "sell-through")
+    eq(ns.Stats.Summarize({ since = world.now + 1 }).sellThrough, nil, "no data")
+end)
+
+test("the summary filters by period and character, and breaks down by item", function()
+    local ns, world = Mock.Boot()
+    seedLedger(ns, world)
+    eq(ns.Stats.Summarize({ since = ns.Stats.PeriodStart(7) }).items[2001].soldQty, 0, "old sale outside period")
+    eq(ns.Stats.Summarize().items[2001].soldQty, 1, "all time")
+    eq(ns.Stats.Summarize({ char = "Alt-Hyjal" }).gross, 90000, "character")
+
+    local herb = ns.Stats.Summarize().items[1001]
+    eq(herb.soldQty, 60)
+    eq(herb.net, -500 + 60000 + 300 - 3000 - 150)
+end)
+
+test("the series covers each day of the period, including empty ones", function()
+    local ns, world = Mock.Boot()
+    seedLedger(ns, world)
+    local bars, bucketDays = ns.Stats.BuildSeries({ since = ns.Stats.PeriodStart(7) }, 60)
+    eq(#bars, 7, "bars")
+    eq(bucketDays, 1, "bucket")
+    eq(bars[5].net, -500, "two days ago")
+    eq(bars[6].net, 57300, "yesterday")
+    eq(bars[7].net, -20150, "today")
+    eq(bars[1].net, 0, "empty day")
+    eq(os.date("%d/%m", bars[7].from), os.date("%d/%m", world.now), "last bar is today")
+end)
+
+test("long periods are grouped without losing money", function()
+    local ns, world = Mock.Boot()
+    seedLedger(ns, world)
+    local bars, bucketDays = ns.Stats.BuildSeries({ since = ns.Stats.PeriodStart(90) }, 60)
+    eq(bucketDays, 2, "bucket")
+    eq(#bars, 45, "bars")
+    local total = 0
+    for _, bar in ipairs(bars) do
+        total = total + bar.net
+    end
+    eq(total, ns.Stats.Summarize({ since = ns.Stats.PeriodStart(90) }).net)
+end)
+
+test("an all-time series starts at the first entry, and is empty without any", function()
+    local ns, world = Mock.Boot()
+    local bars = ns.Stats.BuildSeries({}, 60)
+    eq(#bars, 0, "empty")
+    ns.Ledger.Add({ kind = "sold", t = world.now - 2 * 86400, gross = 100, qty = 1 })
+    eq(#ns.Stats.BuildSeries({}, 60), 3, "from first entry")
+end)
+
+-- Walks a whole year so that it covers the clock changes of whatever time zone runs it.
+test("day buckets hold on every day of the year, including clock changes", function()
+    local ns, world = Mock.Boot()
+    for day = 1, 365 do
+        world.now = os.time({ year = 2027, month = 1, day = day, hour = 12 })
+        TradingEssentialsDB.ledger = {}
+        ns.Ledger.Add({ kind = "sold", t = os.time({ year = 2027, month = 1, day = day - 1, hour = 23 }), gross = 100, qty = 1 })
+        ns.Ledger.Add({ kind = "sold", t = os.time({ year = 2027, month = 1, day = day, hour = 1 }), gross = 200, qty = 1 })
+        local bars = ns.Stats.BuildSeries({ since = ns.Stats.PeriodStart(3) }, 60)
+        eq(#bars, 3, "bars on day " .. day)
+        eq(bars[1].net, 0, "two days ago, on day " .. day)
+        eq(bars[2].net, 100, "yesterday, on day " .. day)
+        eq(bars[3].net, 200, "today, on day " .. day)
+    end
+end)
+
+-- Auction house scan helpers -----------------------------------------------------
+
+-- Opens the auction house and lets the automatic scan, if any, be requested.
+local function openAuctionHouse()
+    Mock.Fire("AUCTION_HOUSE_SHOW")
+    Mock.RunTimers()
+end
+
+-- Scans are only made by hand: the auction house is opened, then a scan asked for.
+local function scanAuctionHouse()
+    openAuctionHouse()
+    SlashCmdList.TRADINGESSENTIALS("scan")
+end
+
+-- The server's answer to a scan, read to the end.
+local function answerScan(auctions)
+    Mock.SetReplicate(auctions)
+    Mock.Fire("REPLICATE_ITEM_LIST_UPDATE")
+    Mock.RunTimers()
+end
+
+local function auction(itemID, count, buyout, saleStatus)
+    return { itemID = itemID, count = count, buyout = buyout, saleStatus = saleStatus }
+end
+
+test("item value prefers Auctionator, then the auction house scan, then recent sales", function()
+    local ns, world = Mock.Boot()
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, qty = 10, gross = 1000 })
+    local price, source = ns.Stats.GetUnitPrice(1001)
+    eq(price, 100)
+    eq(source, "sales")
+    eq(ns.Stats.GetUnitPrice(9999), nil, "unknown item")
+
+    scanAuctionHouse()
+    answerScan({ auction(1001, 2, 600) })
+    local seenAt
+    price, source, seenAt = ns.Stats.GetUnitPrice(1001)
+    eq(price, 300)
+    eq(source, "scan")
+    eq(seenAt, world.now)
+
+    rawset(_G, "Auctionator", { API = { v1 = { GetAuctionPriceByItemID = function(caller, id)
+        eq(caller, "TradingEssentials")
+        return id == 1001 and 555 or nil
+    end } } })
+    price, source = ns.Stats.GetUnitPrice(1001)
+    rawset(_G, "Auctionator", nil)
+    eq(price, 555)
+    eq(source, "auctionator")
+end)
+
+test("a broken Auctionator does not break Trading Essentials", function()
+    local ns = Mock.Boot()
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, qty = 1, gross = 100 })
+    rawset(_G, "Auctionator", { API = { v1 = { GetAuctionPriceByItemID = function() error("boom") end } } })
+    local price, source = ns.Stats.GetUnitPrice(1001)
+    rawset(_G, "Auctionator", nil)
+    eq(price, 100)
+    eq(source, "sales")
+end)
+
+test("the sale price average drops out of the recent window", function()
+    local ns, world = Mock.Boot()
+    ns.Ledger.Add({ kind = "sold", t = world.now - 100 * 86400, itemID = 1001, qty = 1, gross = 100 })
+    eq(ns.Stats.GetUnitPrice(1001), nil)
+end)
+
+-- Ledger --------------------------------------------------------------------
+
+test("the ledger drops its oldest entries past the cap", function()
+    local db = { ledger = {} }
+    for i = 1, 20005 do
+        db.ledger[i] = { kind = "expired", t = i, qty = 1 }
+    end
+    Mock.Boot({ db = db })
+    eq(#TradingEssentialsDB.ledger, 20000)
+    eq(TradingEssentialsDB.ledger[1].t, 6)
+end)
+
+test("existing saved data survives a reload", function()
+    local ns = Mock.Boot()
+    Mock.SetBagItem(6, 1, 1001, "Herb", 10)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, qty = 1, gross = 100 })
+    local saved = TradingEssentialsDB
+
+    local reloaded = Mock.Boot({ db = saved })
+    eq(#TradingEssentialsDB.ledger, 1)
+    eq(findRow(reloaded.Stockpile.GetRows(), 1001).bank, 10)
+end)
+
+test("purchases the first schema recorded at zero become unknown, once", function()
+    Mock.Boot({ db = { schema = 1, ledger = {
+        { kind = "bought", t = 1, itemID = 1001, qty = 1, gross = 0 },
+        { kind = "bought", t = 2, itemID = 1001, qty = 1, gross = 300 },
+        { kind = "sold", t = 3, itemID = 1001, qty = 1, gross = 0 },
+    } } })
+    eq(TradingEssentialsDB.ledger[1].gross, nil, "zero was the missing invoice")
+    eq(TradingEssentialsDB.ledger[2].gross, 300, "a known price stays")
+    eq(TradingEssentialsDB.ledger[3].gross, 0, "only purchases")
+    eq(TradingEssentialsDB.schema, 2)
+
+    Mock.Boot()
+    eq(TradingEssentialsDB.schema, 2, "a new account starts at the current schema")
+end)
+
+-- Interface -----------------------------------------------------------------
+
+local function renderedTexts(tableFrame)
+    local texts = {}
+    for _, row in ipairs(tableFrame.ScrollBox.rendered) do
+        local cells = {}
+        for _, cell in ipairs(row.cells) do
+            table.insert(cells, cell.text)
+        end
+        table.insert(texts, table.concat(cells, "|"))
+    end
+    return texts
+end
+
+-- Finds a frame's children built by the tabs through the registry the mock keeps.
+local function captureTables(ns)
+    local tables = {}
+    local create = ns.UI.CreateTable
+    ns.UI.CreateTable = function(...)
+        local tbl = create(...)
+        table.insert(tables, tbl)
+        return tbl
+    end
+    return tables
+end
+
+local function captureSegments(ns)
+    local segments = {}
+    local create = ns.UI.CreateSegments
+    ns.UI.CreateSegments = function(parent, options, initial, onChange)
+        table.insert(segments, onChange)
+        return create(parent, options, initial, onChange)
+    end
+    return segments
+end
+
+test("the window opens on every tab, with and without data", function()
+    local ns, world = Mock.Boot()
+    ns.UI.Toggle()
+    ns.UI.Open("stock")
+    ns.UI.Open("stats")
+    ns.UI.Open("auctions")
+    eq(TradingEssentialsMainFrame:IsShown(), true)
+
+    seedLedger(ns, world)
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    ns.UI.Open("stock")
+    ns.UI.Open("stats")
+
+    ns.UI.Toggle()
+    eq(TradingEssentialsMainFrame:IsShown(), false, "toggled off")
+    ns.UI.Toggle()
+    eq(TradingEssentialsMainFrame:IsShown(), true, "toggled on")
+end)
+
+test("the auctions tab lists history, filters it, and sorts by column", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    local segments = captureSegments(ns)
+    seedLedger(ns, world)
+    ns.UI.Open("auctions")
+    local list = tables[1]
+
+    eq(#list.rows, 6, "all")
+    eq(list.rows[1].when >= list.rows[2].when, true, "newest first")
+    eq(list.rows[#list.rows].entry.t, world.now - 40 * 86400, "oldest last")
+
+    segments[1]("sold")
+    eq(#list.rows, 2, "sales")
+    segments[1]("all")
+
+    list.columns[6].header.scripts.OnClick()
+    eq(list.sortColumn.key, "amount")
+    eq(list.rows[1].amount, 90000 - 4500, "largest amount first")
+    list.columns[6].header.scripts.OnClick()
+    eq(list.rows[1].amount, -20000, "reversed")
+
+    local rendered = renderedTexts(list)
+    eq(#rendered, 6, "rows rendered")
+end)
+
+test("row tooltips explain the amounts of each kind of entry", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    seedLedger(ns, world)
+    ns.UI.Open("auctions")
+    for _, row in ipairs(tables[1].ScrollBox.rendered) do
+        row.scripts.OnEnter(row)
+        row.scripts.OnLeave(row)
+    end
+    local found = false
+    for _, line in ipairs(GameTooltip.lines) do
+        if line == "Auction house cut=-3000c" then
+            found = true
+        end
+    end
+    eq(found, true, "cut shown as a deduction")
+end)
+
+test("the active filter lists live auctions with their remaining time", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    local segments = captureSegments(ns)
+    world.owned = {
+        { auctionID = 1, itemKey = { itemID = 1001 }, itemLink = "|Hitem:1001|h[Herb]|h", status = 0, quantity = 5, timeLeftSeconds = 7200, buyoutAmount = 100 },
+        { auctionID = 2, itemKey = { itemID = 1002 }, itemLink = "|Hitem:1002|h[Ore]|h", status = 1, quantity = 2, timeLeftSeconds = 1800, buyoutAmount = 50 },
+    }
+    Mock.Fire("OWNED_AUCTIONS_UPDATED")
+    ns.UI.Open("auctions")
+    segments[1]("active")
+
+    local rows = tables[1].rows
+    eq(#rows, 2)
+    local byName = {}
+    for _, row in ipairs(rows) do byName[row.name] = row end
+    eq(byName.Herb.amount, 500, "unit price times quantity")
+    eq(byName.Herb.whenText, "2 h")
+    eq(byName.Ore.kindText, "Sold, mail pending")
+    for _, row in ipairs(tables[1].ScrollBox.rendered) do
+        row.scripts.OnEnter(row)
+    end
+end)
+
+test("the search box filters by name, ignoring case and pattern characters", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    local boxes = {}
+    local createBox = ns.UI.CreateSearchBox
+    ns.UI.CreateSearchBox = function(parent, onChange)
+        table.insert(boxes, onChange)
+        return createBox(parent, onChange)
+    end
+    seedLedger(ns, world)
+    ns.UI.Open("auctions")
+
+    boxes[1]("SWOR")
+    eq(#tables[1].rows, 2)
+    boxes[1]("%w[")
+    eq(#tables[1].rows, 0, "pattern characters are literal")
+    boxes[1]("")
+    eq(#tables[1].rows, 6)
+end)
+
+-- The first frame from a template inside a window, the settings page having its own.
+local function firstWithin(template, ancestor)
+    for _, frame in ipairs(Mock.FindFrames(template)) do
+        if Mock.IsWithin(frame, ancestor) then
+            return frame
+        end
+    end
+end
+
+local function selectCharacter(key)
+    local dropdown = firstWithin("WowStyle1DropdownTemplate", TradingEssentialsMainFrame)
+    for _, entry in ipairs(Mock.MenuEntries(dropdown)) do
+        if entry.data == key then
+            entry.setSelected(entry.data)
+            return
+        end
+    end
+    error("No menu entry for " .. tostring(key))
+end
+
+test("the character menu lists the account, then this character, then the others", function()
+    local ns = Mock.Boot()
+    TradingEssentialsDB.characters["Zed-Hyjal"] = { money = 0, stock = { bags = {}, bank = {}, mail = {} }, auctions = {} }
+    TradingEssentialsDB.characters["Alt-Hyjal"] = { money = 0, class = "WARRIOR", stock = { bags = {}, bank = {}, mail = {} }, auctions = {} }
+    ns.UI.Open("auctions")
+
+    local entries = Mock.MenuEntries(firstWithin("WowStyle1DropdownTemplate", TradingEssentialsMainFrame))
+    eq(#entries, 4)
+    eq(entries[1].text, "Whole account")
+    eq(entries[2].data, PLAYER_KEY, "this character first")
+    eq(entries[3].data, "Alt-Hyjal")
+    eq(entries[4].data, "Zed-Hyjal")
+    eq(entries[3].text:find("Alt", 1, true) ~= nil and entries[3].text:find("|c", 1, true) == 1, true, "name in class colour")
+    eq(entries[4].text, "Zed", "plain when the class is unknown")
+
+    eq(entries[1].isSelected(entries[1].data), true, "account selected by default")
+    entries[3].setSelected(entries[3].data)
+    eq(entries[1].isSelected(entries[1].data), false)
+    eq(entries[3].isSelected(entries[3].data), true)
+end)
+
+test("the character menu filters every tab, including other characters than this one", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    seedLedger(ns, world)
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    TradingEssentialsDB.characters["Alt-Hyjal"] = { money = 0, stock = { bags = { [1001] = 5 }, bank = {}, mail = {} }, auctions = {} }
+
+    ns.UI.Open("auctions")
+    eq(#tables[1].rows, 6, "history, all characters")
+
+    selectCharacter(PLAYER_KEY)
+    eq(#tables[1].rows, 5, "history, this character")
+    selectCharacter("Alt-Hyjal")
+    eq(#tables[1].rows, 1, "history, the alt")
+
+    ns.UI.Open("stock")
+    eq(tables[2].rows[1].total, 5, "stock, the alt")
+
+    selectCharacter("")
+    eq(tables[2].rows[1].total, 15, "stock, all characters")
+end)
+
+test("the filter buttons mark the selection, and can be greyed out", function()
+    local ns = Mock.Boot()
+    local chosen = {}
+    local group = ns.UI.CreateSegments(UIParent, {
+        { value = "a", label = "One" },
+        { value = "b", label = "Two" },
+    }, "a", function(value) table.insert(chosen, value) end)
+
+    eq(group.buttons.a.Underline:IsShown(), true, "initial selection")
+    eq(group.buttons.b.Underline:IsShown(), false)
+    eq(#chosen, 0, "no notification for the initial state")
+
+    group.buttons.b.scripts.OnClick(group.buttons.b)
+    eq(chosen[1], "b", "notified")
+    eq(group.buttons.a.Underline:IsShown(), false, "moved")
+    eq(group.buttons.b.Selected:IsShown(), true, "moved")
+
+    group.SetActive(false)
+    eq(group.buttons.a.enabled, false, "greyed")
+    group.SetActive(true)
+    eq(group.buttons.a.enabled, true, "back")
+end)
+
+-- Stock filters ----------------------------------------------------------------
+
+local function stockFixture()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    local segments = captureSegments(ns)
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    ns.Ledger.Add({ kind = "sold", itemID = 1002, name = "Ore", qty = 1, gross = 10 })
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(6, 1, 1001, "Herb", 20)
+    Mock.SetBagItem(12, 1, 1001, "Herb", 40)
+    Mock.SetBagItem(0, 2, 1002, "Ore", 3)
+    Mock.SetBagItem(12, 2, 1003, "Gem", 7)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    Mock.Fire("BANKFRAME_CLOSED")
+    ns.UI.Open("stock")
+    return ns, tables[1], segments[1]
+end
+
+local function rowIDs(tbl)
+    local ids = {}
+    for _, row in ipairs(tbl.rows) do
+        table.insert(ids, row.itemID)
+    end
+    table.sort(ids)
+    return table.concat(ids, ",")
+end
+
+test("the stock shows every place by default", function()
+    local _, list = stockFixture()
+    eq(rowIDs(list), "1001,1002,1003")
+end)
+
+test("the stock filters by bags, personal bank or shared stock", function()
+    local _, list, select = stockFixture()
+    select("bags")
+    eq(rowIDs(list), "1001,1002", "bags")
+    select("bank")
+    eq(rowIDs(list), "1001", "personal bank")
+    select("warband")
+    eq(rowIDs(list), "1001,1003", "shared stock")
+    select("mail")
+    eq(rowIDs(list), "", "mail")
+    eq(list.Empty:IsShown(), true, "says so when empty")
+    select("all")
+    eq(rowIDs(list), "1001,1002,1003", "back to everything")
+end)
+
+test("a filtered stock values what is in that place, and sorts on it", function()
+    local _, list, select = stockFixture()
+    select("warband")
+    eq(list.sortColumn.key, "warband", "sorted on the filtered place")
+    eq(list.rows[1].itemID, 1001, "most in that place first")
+    eq(list.rows[1].value, 40 * 100, "valued on the 40 in the shared stock, not the 70 in total")
+    eq(list.rows[1].total, 70, "the total stays visible")
+
+    select("all")
+    eq(list.sortColumn.key, "total")
+    eq(list.rows[1].value, 70 * 100)
+end)
+
+test("the shared stock stays visible with a character selected", function()
+    local _, list, select = stockFixture()
+    TradingEssentialsDB.characters["Alt-Hyjal"] = { money = 0, stock = { bags = {}, bank = {}, mail = {} }, auctions = {} }
+    selectCharacter("Alt-Hyjal")
+    eq(rowIDs(list), "", "the alt holds nothing itself")
+    select("warband")
+    eq(rowIDs(list), "1001,1003", "the shared stock is nobody's")
+    select("bags")
+    eq(rowIDs(list), "", "the alt's bags are empty")
+end)
+
+-- Stock grid -----------------------------------------------------------------
+
+local function captureGrids(ns)
+    local grids = {}
+    local create = ns.UI.CreateItemGrid
+    ns.UI.CreateItemGrid = function(...)
+        local grid = create(...)
+        table.insert(grids, grid)
+        return grid
+    end
+    return grids
+end
+
+-- Draws the first line of a grid as the scroll box would, on a new frame or one it
+-- reuses, and returns its slots and the frame.
+local function drawGridLine(grid, line)
+    if not line then
+        line = CreateFrame("Button", nil, grid.ScrollBox)
+        line:SetPoint("TOPLEFT", grid.ScrollBox, "TOPLEFT")
+        line:SetPoint("TOPRIGHT", grid.ScrollBox, "TOPRIGHT")
+        line:SetHeight(grid.ScrollBox.view.extent)
+    end
+    grid.ScrollBox.view.initializer(line, grid.lines[1])
+    return line.slots, line
+end
+
+local function gridFixture()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    local grids = captureGrids(ns)
+    local segments = captureSegments(ns)
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(6, 1, 1001, "Herb", 20)
+    Mock.SetBagItem(0, 2, 1002, "Ore", 12345)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    Mock.Fire("BANKFRAME_CLOSED")
+    ns.UI.Open("stock")
+    return ns, tables[1], grids[1], segments[1], segments[2]
+end
+
+test("the window opens on the stock, as a grid", function()
+    local ns = Mock.Boot()
+    local grids = captureGrids(ns)
+    SlashCmdList.TRADINGESSENTIALS("")
+    eq(TradingEssentialsMainFrame.selectedTab, 1)
+    eq(TradingEssentialsMainFrame.Tabs[1]:GetText(), "Stock", "the first tab")
+    eq(grids[1]:IsShown(), true, "the grid")
+end)
+
+test("the stock opens as a grid, and the list view is kept for next time", function()
+    local ns, list, grid, _, view = gridFixture()
+    eq(grid:IsShown(), true, "grid by default")
+    eq(list:IsShown(), false)
+
+    view("list")
+    eq(grid:IsShown(), false, "list chosen")
+    eq(list:IsShown(), true)
+    eq(ns.db.ui.stockView, "list", "saved")
+
+    view("grid")
+    eq(grid:IsShown(), true, "back to the grid")
+    eq(ns.db.ui.stockView, nil, "the default is not saved")
+end)
+
+test("the view buttons draw their own marks, which show the selected view", function()
+    local ns = Mock.Boot()
+    local groups = {}
+    local create = ns.UI.CreateSegments
+    ns.UI.CreateSegments = function(...)
+        local group = create(...)
+        table.insert(groups, group)
+        return group
+    end
+    ns.UI.Open("stock")
+    local views = groups[2]
+    for _, value in ipairs({ "grid", "list" }) do
+        local button = views.buttons[value]
+        eq(#button.Glyph > 0, true, value .. " has a drawing")
+        eq(button.width, ns.UI.CONTROL_HEIGHT, value .. " is square")
+        for _, mark in ipairs(button.Glyph) do
+            local rect, box = Mock.Rect(mark), Mock.Rect(button)
+            eq(rect.left >= box.left and rect.right <= box.right and rect.bottom >= box.bottom and rect.top <= box.top,
+                true, value .. " drawing inside its button")
+        end
+    end
+    eq(views.buttons.grid.Glyph[1].color[4], 1, "the selected view stands out")
+    eq(views.buttons.list.Glyph[1].color[4] < 1, true)
+end)
+
+test("the stock grid shows each item's icon and its count in the selected place", function()
+    local _, list, grid, place, view = gridFixture()
+    view("grid")
+    eq(#grid.items, 2, "one slot per item")
+    eq(grid.items[1].itemID, 1002, "in the list's order, most first")
+
+    local slots, line = drawGridLine(grid)
+    eq(slots[1].Count:GetText(), "12k", "a large count is shortened")
+    eq(slots[2].Count:GetText(), "30", "every place")
+    eq(slots[2].Icon.texture ~= nil, true, "an icon")
+
+    place("bank")
+    eq(#grid.items, 1, "filtered like the list")
+    slots = drawGridLine(grid, line)
+    eq(slots[1].Count:GetText(), "20", "the bank alone, on a reused line")
+    eq(slots[2]:IsShown(), false, "the slot left over is hidden")
+    eq(list.rows[1].itemID, 1001, "the list follows too")
+end)
+
+test("the stock grid shows the item tooltip on a slot", function()
+    local _, _, grid, _, view = gridFixture()
+    view("grid")
+    local slot = drawGridLine(grid)[2]
+    slot.scripts.OnEnter(slot)
+    eq(rawget(GameTooltip, "itemID") ~= nil or rawget(GameTooltip, "link") ~= nil, true, "the item's tooltip")
+    eq(GameTooltip.owner, slot, "beside the slot")
+end)
+
+test("the stock grid breaks its items into full lines", function()
+    local _, _, grid = gridFixture()
+    local items = {}
+    for i = 1, grid.stride * 2 + 1 do
+        items[i] = { itemID = 1001, total = i }
+    end
+    grid:SetItems(items)
+    eq(#grid.lines, 3)
+    eq(#grid.lines[2].items, grid.stride)
+    eq(#grid.lines[3].items, 1)
+    eq(grid.stride >= 10, true, "a useful number of slots per line")
+end)
+
+test("stack counts read as in the bags", function()
+    local ns = Mock.Boot()
+    eq(ns.UI.FormatStackCount(1), "", "a single item has no number")
+    eq(ns.UI.FormatStackCount(9999), "9999")
+    eq(ns.UI.FormatStackCount(10000), "10k")
+    eq(ns.UI.FormatStackCount(2500000), "2M")
+end)
+
+
+test("the stock shows bound items only when asked, and values only what can be sold", function()
+    local ns = Mock.Boot()
+    local tables = captureTables(ns)
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(0, 2, 1001, "Herb", 4, { isBound = true })
+    Mock.SetBagItem(0, 3, 3001, "Soulbound Ring", 1, { isBound = true })
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    ns.UI.Open("stock")
+    local list = tables[1]
+    local box
+    for _, candidate in ipairs(Mock.FindFrames("UICheckButtonTemplate")) do
+        if Mock.IsWithin(candidate, TradingEssentialsMainFrame) then
+            box = candidate
+        end
+    end
+    eq(box:GetChecked(), false, "hidden by default")
+    eq(rowIDs(list), "1001")
+    eq(list.rows[1].total, 10)
+
+    box:SetChecked(true)
+    box.scripts.OnClick(box)
+    eq(TradingEssentialsDB.ui.showBound, true, "kept for next time")
+    eq(rowIDs(list), "1001,3001", "the bound ring")
+    local herb = list.rows[1].itemID == 1001 and list.rows[1] or list.rows[2]
+    eq(herb.total, 14, "bound units counted")
+    eq(herb.value, 10 * 100, "valued on the 10 that can be sold")
+
+    box:SetChecked(false)
+    box.scripts.OnClick(box)
+    eq(TradingEssentialsDB.ui.showBound, nil, "the default is not saved")
+    eq(rowIDs(list), "1001")
+end)
+
+-- Keeps what each tile displays, by key.
+local function captureTileValues(ns)
+    local values = {}
+    local createTile = ns.UI.CreateTile
+    ns.UI.CreateTile = function(parent, spec, width)
+        local tile = createTile(parent, spec, width)
+        local set = tile.SetValue
+        tile.SetValue = function(self, text, color)
+            values[spec.key] = text
+            set(self, text, color)
+        end
+        return tile
+    end
+    return values
+end
+
+test("the stock tiles follow the selected place", function()
+    local ns = Mock.Boot()
+    local values = captureTileValues(ns)
+    local segments = captureSegments(ns)
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(6, 1, 1001, "Herb", 20)
+    Mock.SetBagItem(12, 2, 1002, "Ore", 7)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    Mock.Fire("BANKFRAME_CLOSED")
+    ns.UI.Open("stock")
+    eq(values.units, "37", "everywhere")
+    eq(values.items, "2", "everywhere")
+
+    segments[1]("bags")
+    eq(values.units, "10", "in the bags")
+    eq(values.items, "1", "in the bags")
+    eq(values.value, "1000c", "valued in the bags")
+
+    segments[1]("bank")
+    eq(values.units, "20", "in the bank")
+    eq(values.value, "2000c", "valued in the bank")
+end)
+
+test("the stock tiles sum the filter, and the search only narrows the list", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    local values = captureTileValues(ns)
+    local boxes = {}
+    local createBox = ns.UI.CreateSearchBox
+    ns.UI.CreateSearchBox = function(parent, onChange)
+        table.insert(boxes, onChange)
+        return createBox(parent, onChange)
+    end
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(0, 2, 1002, "Ore", 3)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    ns.UI.Open("stock")
+    eq(values.items, "2")
+    eq(values.units, "13")
+    eq(values.value, "1000c")
+
+    boxes[1]("herb")
+    eq(#tables[1].rows, 1, "list narrowed")
+    eq(values.items, "2", "tiles unchanged")
+end)
+
+test("the change over 7 days only shows on the whole account's stock", function()
+    local ns, world = Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    world.now = world.now + 8 * 86400
+    Mock.SetBagItem(0, 1, 1001, "Herb", 25)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    local tables = captureTables(ns)
+    local segments = captureSegments(ns)
+    ns.UI.Open("stock")
+    eq(tables[1].rows[1].change, 15, "whole account")
+    segments[1]("bags")
+    eq(tables[1].rows[1].change, nil, "history does not cover one place")
+    segments[1]("all")
+    selectCharacter(PLAYER_KEY)
+    eq(tables[1].rows[1].change, nil, "nor one character")
+end)
+
+-- Gold tab ---------------------------------------------------------------------
+
+local function goldFixture()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    local segments = captureSegments(ns)
+    local charts = {}
+    local createChart = ns.UI.CreateLineChart
+    ns.UI.CreateLineChart = function(...)
+        local chart = createChart(...)
+        table.insert(charts, chart)
+        return chart
+    end
+    setCharacterGold(ns, world, PLAYER_KEY, { { -5, 1000000 }, { -3, 1400000 }, { -1, 1200000 }, { 0, 1500000 } }, "MAGE")
+    setCharacterGold(ns, world, "Alt-Hyjal", { { -5, 300000 }, { 0, 350000 } }, "WARRIOR")
+    setWarbandGold(ns, world, { { -5, 2000000 }, { -2, 2500000 } })
+    ns.UI.Open("gold")
+    return ns, world, tables[1], segments, charts[1]
+end
+
+test("the gold tab draws its chart, table and highlights for the selection", function()
+    local ns, world, breakdown, segments, chart = goldFixture()
+    eq(#breakdown.rows, 3, "three holders")
+    eq(breakdown.rows[1].key, "warband", "largest first")
+
+    local shown = 0
+    for _, line in ipairs(chart.lines) do
+        if line:IsShown() then shown = shown + 1 end
+    end
+    eq(shown, 5, "six days, five segments")
+    eq(chart.Empty:IsShown(), false, "enough history")
+    eq(chart.Note.text, "Tracked since " .. os.date("%m/%d", world.now - 5 * 86400))
+
+    segments[2]("warband")
+    eq(#breakdown.rows, 1, "warband only")
+    eq(breakdown.rows[1].key, "warband")
+    selectCharacter("Alt-Hyjal")
+    eq(#breakdown.rows, 1, "one character")
+    eq(breakdown.rows[1].key, "Alt-Hyjal")
+    local row = breakdown.ScrollBox.rendered[1]
+    eq(row.cells[1].text:find("Alt", 1, true) ~= nil, true, "holder named")
+    selectCharacter("")
+    segments[2]("all")
+    eq(#breakdown.rows, 3)
+end)
+
+test("holder filters grey out while a character is selected", function()
+    local ns, world, breakdown = goldFixture()
+    local capture = Mock.Objects()
+    local holderGroup
+    for _, object in ipairs(capture) do
+        if rawget(object, "buttons") and object.buttons.characters then
+            holderGroup = object
+        end
+    end
+    eq(holderGroup.buttons.characters.enabled, true, "active")
+    selectCharacter("Alt-Hyjal")
+    eq(holderGroup.buttons.characters.enabled, false, "greyed")
+    selectCharacter("")
+    eq(holderGroup.buttons.characters.enabled, true, "active again")
+end)
+
+test("the gold chart keeps its marks inside the plot, and shows each point on hover", function()
+    local ns, world, breakdown, segments, chart = goldFixture()
+    local plot = Mock.Rect(chart.plot)
+    for _, slot in ipairs(chart.slots) do
+        if slot:IsShown() then
+            eq(slot.y >= 0 and slot.y <= chart.plotHeight, true, "y in the plot: " .. slot.y)
+            eq(slot.x >= 0 and slot.x <= chart.plotWidth, true, "x in the plot: " .. slot.x)
+            local rect = Mock.Rect(slot)
+            eq(rect.left >= plot.left - 0.01 and rect.right <= plot.right + 0.01, true, "hover area in the plot")
+        end
+    end
+
+    local slot = chart.slots[6]
+    slot.scripts.OnEnter(slot)
+    eq(chart.Crosshair:IsShown(), true, "crosshair")
+    eq(chart.Marker:IsShown(), true, "marker")
+    local lines = table.concat(GameTooltip.lines, ";")
+    eq(lines:find("Current gold=", 1, true) ~= nil, true, "value in the tooltip: " .. lines)
+    eq(lines:find("Change=", 1, true) ~= nil, true, "change in the tooltip")
+    slot.scripts.OnLeave(slot)
+    eq(chart.Crosshair:IsShown(), false, "crosshair gone")
+    eq(chart.Marker:IsShown(), false, "marker gone")
+end)
+
+test("the gold chart copes with no data, one day, a flat line and fewer points later", function()
+    local ns, world, breakdown, segments, chart = goldFixture()
+
+    chart:SetPoints({})
+    eq(chart.Empty:IsShown(), true, "no data")
+    eq(chart.TopLabel.text, "", "no axis")
+
+    chart:SetPoints({ { t = world.now, day = 1, value = 5000, delta = 0 } })
+    eq(chart.Empty:IsShown(), true, "one day: history still building")
+    eq(chart.slots[1]:IsShown(), true, "that day can be hovered")
+    eq(chart.slots[2]:IsShown(), false, "older slots hidden")
+    eq(chart.lines[1]:IsShown(), false, "older lines hidden")
+
+    local flat = {}
+    for i = 1, 5 do
+        flat[i] = { t = world.now + i * 86400, day = i, value = 0, delta = 0 }
+    end
+    chart:SetPoints(flat)
+    eq(chart.slots[1].y >= 0, true, "no division by zero on a flat line")
+
+    local long = {}
+    for i = 1, 60 do
+        long[i] = { t = world.now + i * 86400, day = i, value = i * 10000, delta = 10000 }
+    end
+    chart:SetPoints(long)
+    eq(chart.dots[1]:IsShown(), false, "no dots on a dense line")
+end)
+
+test("the gold chart hides what a shorter series no longer uses", function()
+    local ns, world, breakdown, segments, chart = goldFixture()
+    local function series(count)
+        local points = {}
+        for i = 1, count do
+            points[i] = { t = world.now + i * 86400, day = i, value = i * 100000, delta = 100000 }
+        end
+        return points
+    end
+    chart:SetPoints(series(5))
+    eq(chart.lines[4]:IsShown(), true, "five days: four segments")
+    eq(chart.dots[5]:IsShown(), true, "five days: five dots")
+
+    chart:SetPoints(series(3))
+    eq(chart.lines[2]:IsShown(), true, "three days: two segments")
+    eq(chart.lines[3]:IsShown(), false, "the third segment is gone")
+    eq(chart.lines[4]:IsShown(), false, "the fourth too")
+    eq(chart.slots[3]:IsShown(), true, "third day still hoverable")
+    eq(chart.slots[4]:IsShown(), false, "fourth day gone")
+    eq(chart.dots[4]:IsShown(), false, "its dot too")
+end)
+
+test("the net result chart stays usable when bars disappear", function()
+    local ns, world = Mock.Boot()
+    local charts = {}
+    local createChart = ns.UI.CreateBarChart
+    ns.UI.CreateBarChart = function(...)
+        local chart = createChart(...)
+        table.insert(charts, chart)
+        return chart
+    end
+    seedLedger(ns, world)
+    ns.UI.Open("stats")
+    local chart = charts[1]
+    local slot = chart.slots[#chart.slots]
+    slot.scripts.OnEnter(slot)
+    slot.scripts.OnLeave(slot)
+    chart:SetBars({})
+    eq(slot:IsShown(), false, "hidden")
+end)
+
+test("tabs are only built when first shown", function()
+    local ns = Mock.Boot()
+    local tables = captureTables(ns)
+    ns.UI.Open("stats")
+    eq(#tables, 1)
+    ns.UI.Toggle()
+    ns.UI.Open("stock") -- Reopening a closed window on a tab never built yet.
+    eq(#tables, 2)
+    eq(TradingEssentialsMainFrame:IsShown(), true)
+end)
+
+test("the open tab refreshes when data changes, and a closed window does not", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    ns.UI.Open("auctions")
+    eq(#tables[1].rows, 0)
+
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    Mock.RunTimers()
+    eq(#tables[1].rows, 1, "refreshed")
+
+    ns.UI.Toggle()
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    Mock.RunTimers()
+    eq(#tables[1].rows, 1, "closed window left alone")
+end)
+
+test("the stock tab shows locations, value and history", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 10, gross = 1000 })
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(6, 1, 1001, "Herb", 30)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    Mock.Fire("BANKFRAME_CLOSED")
+    ns.UI.Open("stock")
+
+    local rows = tables[1].rows
+    eq(#rows, 1)
+    eq(rows[1].total, 40)
+    eq(rows[1].value, 4000, "valued at average sale")
+    eq(rows[1].name, "Herb")
+    eq(rows[1].change, nil, "no history yet")
+
+    local row = tables[1].ScrollBox.rendered[1]
+    row.scripts.OnEnter(row)
+    eq(row.cells[1].text, "Herb")
+    eq(row.cells[2].text, "40")
+    eq(GameTooltip.itemID, 1001)
+end)
+
+test("items of offline characters still display from saved details", function()
+    local ns = Mock.Boot()
+    local tables = captureTables(ns)
+    TradingEssentialsDB.characters["Alt-Hyjal"] = { money = 0, stock = { bags = { [4242] = 3 }, bank = {}, mail = {} }, auctions = {} }
+    ns.RememberItem(4242, "Rare Gem", 2, 999)
+    ns.UI.Open("stock")
+    eq(tables[1].rows[1].name, "Rare Gem")
+    eq(tables[1].ScrollBox.rendered[1].cells[1].text, "Rare Gem")
+end)
+
+test("items never seen by this client show a placeholder instead of an error", function()
+    local ns = Mock.Boot()
+    local tables = captureTables(ns)
+    TradingEssentialsDB.characters["Alt-Hyjal"] = { money = 0, stock = { bags = { [4242] = 3 }, bank = {}, mail = {} }, auctions = {} }
+    ns.UI.Open("stock")
+    eq(tables[1].ScrollBox.rendered[1].cells[1].text, "Unknown item")
+end)
+
+test("the stats tab fills its tiles and item table for the chosen period", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    local segments = captureSegments(ns)
+    seedLedger(ns, world)
+    ns.UI.Open("stats")
+
+    local items = tables[1].rows
+    eq(#items, 2, "items within 30 days")
+    eq(items[1].itemID, 1001, "best net first")
+
+    segments[#segments](7)
+    segments[#segments](0)
+    eq(#tables[1].rows, 2, "all time")
+    local herb, sword
+    for _, row in ipairs(tables[1].rows) do
+        if row.itemID == 1001 then herb = row end
+        if row.itemID == 2001 then sword = row end
+    end
+    eq(herb.avgSale, 1000, "per unit, over 60 sold")
+    eq(herb.avgPurchase, nil, "never bought")
+    eq(sword.avgSale, 90000)
+    eq(sword.avgPurchase, 20000)
+end)
+
+test("the stats search narrows the item table, not the tiles", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    seedLedger(ns, world)
+    ns.UI.Open("stats")
+    local box = nil
+    for _, frame in ipairs(Mock.FindFrames("SearchBoxTemplate")) do
+        if Mock.IsVisible(frame) then
+            box = frame
+        end
+    end
+    local summary = ns.Stats.Summarize({ since = ns.Stats.PeriodStart(30) })
+    box:SetText("HERB")
+    box.scripts.OnTextChanged(box, true)
+    Mock.RunTimers()
+    eq(#tables[1].rows, 1)
+    eq(tables[1].rows[1].itemID, 1001, "case is ignored")
+    eq(ns.Stats.Summarize({ since = ns.Stats.PeriodStart(30) }).net, summary.net, "the totals stay whole")
+end)
+
+-- Layout -----------------------------------------------------------------------
+
+-- The heaviest account the game allows, in each language: 12-letter names, and every
+-- character at the gold cap.
+local GOLD_CAP = 99999990000
+local LONGEST_NAME = "Twelveletter"
+
+local layoutLocale = "enUS"
+
+local function layoutTest(name, fn)
+    for _, locale in ipairs({ "enUS", unpack(LOCALES) }) do
+        test(name .. " [" .. locale .. "]", function()
+            layoutLocale = locale
+            fn()
+        end)
+    end
+end
+
+local function layoutFixture()
+    local ns, world = Mock.Boot({ locale = layoutLocale, money = GOLD_CAP })
+    Mock.UseRealisticMoney()
+    for i = 1, 40 do
+        local itemID = 5000 + i
+        local name = "An item with a really very long name, number " .. i
+        ns.RememberItem(itemID, name, 3, 1000 + itemID)
+        Mock.SetBagItem(0, i, itemID, name, 1234 + i)
+        Mock.SetBagItem(6, i, itemID, name, 5432)
+        Mock.SetBagItem(12, i, itemID, name, 9999)
+        ns.Ledger.Add({ kind = "sold", itemID = itemID, name = name, qty = 1000, gross = 998765400, cut = 49938270, deposit = 123456, t = world.now - i * 86400, char = PLAYER_KEY })
+        ns.Ledger.Add({ kind = "bought", itemID = itemID, name = name, qty = 999, gross = 887654300, t = world.now - i * 43200, char = LONGEST_NAME .. "-Hyjal" })
+        ns.Ledger.Add({ kind = "post", itemID = itemID, name = name, qty = 1, unit = 993456, deposit = 123456, t = world.now - i * 21600 })
+    end
+    world.warbandMoney = GOLD_CAP
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    Mock.Fire("BANKFRAME_CLOSED")
+    setCharacterGold(ns, world, PLAYER_KEY, { { -60, GOLD_CAP / 2 }, { -30, GOLD_CAP / 4 }, { -2, GOLD_CAP / 3 }, { 0, GOLD_CAP } }, "MAGE")
+    for i = 1, 14 do
+        local letter = string.char(96 + i)
+        setCharacterGold(ns, world, LONGEST_NAME:sub(1, 11) .. letter .. "-Hyjal", { { -40, GOLD_CAP / 2 }, { 0, GOLD_CAP } }, "WARRIOR")
+    end
+    return ns, world
+end
+
+local function overlap(a, b)
+    return a.left < b.right - 0.01 and b.left < a.right - 0.01 and a.bottom < b.top - 0.01 and b.bottom < a.top - 0.01
+end
+
+local function describe(object, rect)
+    return ("%s %s [%.0f,%.0f %.0f,%.0f] %q"):format(object.kind, tostring(rawget(object, "template") or rawget(object, "frameType") or ""),
+        rect.left, rect.bottom, rect.right, rect.top, tostring(rawget(object, "text") or ""))
+end
+
+local function isInsideTabButton(object, frame)
+    while object and object ~= frame do
+        if rawget(object, "template") == "PanelTabButtonTemplate" then
+            return true
+        end
+        object = rawget(object, "parent")
+    end
+    return false
+end
+
+-- Everything visible in the window, other than the tab buttons below it by design.
+local function visibleContent(frame)
+    local found = {}
+    for _, object in ipairs(Mock.Objects()) do
+        if Mock.IsWithin(object, frame) and Mock.IsVisible(object) and not isInsideTabButton(object, frame) then
+            local rect = Mock.Rect(object)
+            if rect then
+                table.insert(found, { object = object, rect = rect })
+            end
+        end
+    end
+    return found
+end
+
+local function directChildren(parent)
+    local found = {}
+    for _, object in ipairs(Mock.Objects()) do
+        if rawget(object, "parent") == parent and Mock.IsVisible(object) then
+            local rect = Mock.Rect(object)
+            if rect then
+                table.insert(found, { object = object, rect = rect })
+            end
+        end
+    end
+    return found
+end
+
+local function activePane(frame)
+    for _, object in ipairs(directChildren(frame.Inset)) do
+        return object.object, object.rect
+    end
+end
+
+for _, tab in ipairs({ "auctions", "stock", "stats", "gold" }) do
+    layoutTest("layout: the " .. tab .. " tab keeps everything inside the window", function()
+        local ns = layoutFixture()
+        ns.UI.Open(tab)
+        local frame = TradingEssentialsMainFrame
+        local window = Mock.Rect(frame)
+        for _, item in ipairs(visibleContent(frame)) do
+            local rect = item.rect
+            eq(rect.left >= window.left and rect.right <= window.right and rect.bottom >= window.bottom and rect.top <= window.top,
+                true, "outside the window: " .. describe(item.object, rect))
+        end
+    end)
+
+    layoutTest("layout: the " .. tab .. " tab keeps its content inside the margins", function()
+        local ns = layoutFixture()
+        ns.UI.Open(tab)
+        local frame = TradingEssentialsMainFrame
+        local inset = Mock.Rect(frame.Inset)
+        local _, pane = activePane(frame)
+        eq(pane.left - inset.left, ns.UI.PADDING, "left margin")
+        eq(inset.right - pane.right, ns.UI.PADDING, "right margin")
+        eq(inset.top - pane.top, ns.UI.PADDING, "top margin")
+        eq(pane.bottom - inset.bottom, ns.UI.PADDING, "bottom margin")
+        eq(pane.right - pane.left, ns.UI.CONTENT_WIDTH, "content width constant")
+        eq(pane.top - pane.bottom, ns.UI.CONTENT_HEIGHT, "content height constant")
+
+        for _, item in ipairs(visibleContent(activePane(frame))) do
+            local rect = item.rect
+            eq(rect.left >= pane.left - 0.01 and rect.right <= pane.right + 0.01 and rect.bottom >= pane.bottom - 0.01 and rect.top <= pane.top + 0.01,
+                true, "outside the pane: " .. describe(item.object, rect))
+        end
+    end)
+
+    layoutTest("layout: the " .. tab .. " tab keeps a gap between its blocks", function()
+        local ns = layoutFixture()
+        ns.UI.Open(tab)
+        local children = directChildren(activePane(TradingEssentialsMainFrame))
+        eq(#children >= 1, true, "has blocks")
+        for i = 1, #children do
+            for j = i + 1, #children do
+                local a, b = children[i], children[j]
+                eq(overlap(a.rect, b.rect), false, "overlap: " .. describe(a.object, a.rect) .. " and " .. describe(b.object, b.rect))
+                if a.object.kind == "frame" and b.object.kind == "frame" then
+                    local horizontal = math.max(a.rect.left - b.rect.right, b.rect.left - a.rect.right)
+                    local vertical = math.max(a.rect.bottom - b.rect.top, b.rect.bottom - a.rect.top)
+                    eq(math.max(horizontal, vertical) >= ns.UI.GAP - 0.01, true,
+                        "too close: " .. describe(a.object, a.rect) .. " and " .. describe(b.object, b.rect))
+                end
+            end
+        end
+    end)
+
+    layoutTest("layout: the " .. tab .. " tab's controls fit without touching", function()
+        local ns = layoutFixture()
+        ns.UI.Open(tab)
+        local frame = TradingEssentialsMainFrame
+        local inset = Mock.Rect(frame.Inset)
+        local window = Mock.Rect(frame)
+        local controls = {}
+        local dropdown = firstWithin("WowStyle1DropdownTemplate", frame)
+        table.insert(controls, { object = dropdown, rect = Mock.Rect(dropdown) })
+        for _, child in ipairs(directChildren(frame)) do
+            if child.object ~= dropdown and child.object ~= frame.Inset and not isInsideTabButton(child.object, frame)
+                and child.object.kind == "frame" then
+                for _, control in ipairs(directChildren(child.object)) do
+                    table.insert(controls, control)
+                end
+            end
+        end
+        eq(#controls >= 2, true, "has controls")
+        for i, control in ipairs(controls) do
+            eq(control.rect.bottom >= inset.top - 0.01, true, "above the content: " .. describe(control.object, control.rect))
+            eq(control.rect.left >= window.left + 60, true, "clear of the portrait: " .. describe(control.object, control.rect))
+            for j = i + 1, #controls do
+                eq(overlap(control.rect, controls[j].rect), false,
+                    "controls touching: " .. describe(control.object, control.rect) .. " and " .. describe(controls[j].object, controls[j].rect))
+            end
+        end
+    end)
+
+    layoutTest("layout: the " .. tab .. " tab's text fits, except item names that may truncate", function()
+        local ns = layoutFixture()
+        ns.UI.Open(tab)
+        for _, item in ipairs(visibleContent(TradingEssentialsMainFrame)) do
+            local object = item.object
+            if object.kind == "text" and object.text ~= "" and not (object.font == "GameFontHighlight") then
+                local available = item.rect.right - item.rect.left
+                eq(object:GetStringWidth() <= available + 0.01, true,
+                    ("text cut: %q is %.0f wide in %.0f"):format(tostring(object.text), object:GetStringWidth(), available))
+            end
+        end
+    end)
+end
+
+layoutTest("layout: filter buttons sit side by side, inside their group", function()
+    local ns = layoutFixture()
+    for _, tab in ipairs({ "auctions", "stock", "stats", "gold" }) do
+        ns.UI.Open(tab)
+        for _, object in ipairs(Mock.Objects()) do
+            if rawget(object, "buttons") and Mock.IsVisible(object) then
+                local group = Mock.Rect(object)
+                local rects = {}
+                for _, button in pairs(object.buttons) do
+                    table.insert(rects, Mock.Rect(button))
+                end
+                eq(#rects >= 2, true, tab .. ": a group has several buttons")
+                for i, rect in ipairs(rects) do
+                    eq(rect.left >= group.left - 0.01 and rect.right <= group.right + 0.01, true, tab .. ": button outside its group")
+                    for j = i + 1, #rects do
+                        eq(overlap(rect, rects[j]), false, tab .. ": buttons on top of each other")
+                    end
+                end
+            end
+        end
+    end
+end)
+
+layoutTest("layout: nothing spills out of the card or row that holds it", function()
+    local ns = layoutFixture()
+    for _, tab in ipairs({ "auctions", "stock", "stats", "gold" }) do
+        ns.UI.Open(tab)
+        local _, pane = activePane(TradingEssentialsMainFrame)
+        for _, item in ipairs(visibleContent(activePane(TradingEssentialsMainFrame))) do
+            local object = item.object
+            local parent = rawget(object, "parent")
+            local holder = Mock.Rect(parent)
+            -- Sort arrows may overhang a narrow column by a few pixels, within the header band.
+            if object.kind ~= "line" and holder and not rawget(object, "atlas") then
+                local rect = item.rect
+                eq(rect.left >= holder.left - 0.01 and rect.right <= holder.right + 0.01
+                    and rect.bottom >= holder.bottom - 3 and rect.top <= holder.top + 3,
+                    true, tab .. ": spills out of its parent: " .. describe(object, rect))
+            end
+        end
+    end
+end)
+
+layoutTest("layout: the highlights fit their card, with the longest amounts", function()
+    local ns = layoutFixture()
+    ns.UI.Open("gold")
+    for _, item in ipairs(visibleContent(TradingEssentialsMainFrame)) do
+        local object = item.object
+        if object.kind == "text" and object.font == "GameFontHighlightSmall" then
+            local parent = rawget(object, "parent")
+            for _, sibling in ipairs(directChildren(parent)) do
+                if sibling.object ~= object and sibling.object.kind == "text" then
+                    eq(overlap(item.rect, sibling.rect), false,
+                        "text overlap: " .. describe(object, item.rect) .. " and " .. describe(sibling.object, sibling.rect))
+                end
+            end
+        end
+    end
+end)
+
+layoutTest("layout: table columns use the width they are given", function()
+    local ns = layoutFixture()
+    local tables = captureTables(ns)
+    for _, tab in ipairs({ "auctions", "stock", "stats", "gold" }) do
+        ns.UI.Open(tab)
+    end
+    for index, tbl in ipairs(tables) do
+        local list = Mock.Rect(tbl.ScrollBox)
+        local last = Mock.Rect(tbl.columns[#tbl.columns].header)
+        eq(list.right - last.right <= 12, true,
+            ("table %d leaves %.0f unused beside the scroll bar"):format(index, list.right - last.right))
+    end
+end)
+
+layoutTest("layout: tiles do not cut their value, label or note", function()
+    local ns, world = layoutFixture()
+    for _, tab in ipairs({ "stats", "gold", "stock" }) do
+        ns.UI.Open(tab)
+        for _, item in ipairs(visibleContent(TradingEssentialsMainFrame)) do
+            local object = item.object
+            if object.kind == "text" and object.font == "GameFontHighlightLarge" then
+                local parent = Mock.Rect(rawget(object, "parent"))
+                eq(item.rect.left + object:GetStringWidth() <= parent.right, true,
+                    ("%s: value too wide: %q"):format(tab, tostring(object.text)))
+            end
+        end
+    end
+end)
+
+layoutTest("layout: table columns fit beside the scroll bar", function()
+    local ns = layoutFixture()
+    local tables = captureTables(ns)
+    for _, tab in ipairs({ "auctions", "stock", "stats", "gold" }) do
+        ns.UI.Open(tab)
+    end
+    eq(#tables, 4)
+    for index, tbl in ipairs(tables) do
+        local list = Mock.Rect(tbl.ScrollBox)
+        for _, column in ipairs(tbl.columns) do
+            local header = Mock.Rect(column.header)
+            eq(header.right <= list.right - 2, true, ("table %d: column %s runs into the scroll bar"):format(index, column.key))
+        end
+    end
+end)
+
+layoutTest("layout: the stock grid's slots fit in their card, beside the scroll bar", function()
+    local ns = layoutFixture()
+    local grids = captureGrids(ns)
+    local segments = captureSegments(ns)
+    ns.UI.Open("stock")
+    segments[2]("grid")
+    local grid = grids[1]
+    local card = Mock.Rect(grid)
+    local box = Mock.Rect(grid.ScrollBox)
+    local slots = drawGridLine(grid)
+    eq(#slots, grid.stride, "a full line")
+    for _, slot in ipairs(slots) do
+        local rect = Mock.Rect(slot)
+        eq(rect.left >= card.left and rect.right <= box.right and rect.top <= card.top, true, "inside the card")
+        local count = Mock.Rect(slot.Count)
+        eq(count.left >= rect.left and count.right <= rect.right, true, "count inside its slot")
+    end
+end)
+
+layoutTest("layout: table rows are not clipped by the list", function()
+    local ns = layoutFixture()
+    local tables = captureTables(ns)
+    ns.UI.Open("auctions")
+    local list = Mock.Rect(tables[1].ScrollBox)
+    for _, row in ipairs(tables[1].ScrollBox.rendered) do
+        local rect = Mock.Rect(row)
+        eq(rect.bottom >= list.bottom - 0.01, true, "row below the list")
+        for _, cell in ipairs(row.cells) do
+            local cellRect = Mock.Rect(cell)
+            eq(cellRect.right <= rect.right, true, "cell beyond the row")
+        end
+    end
+end)
+
+-- Minimap icon ---------------------------------------------------------------
+
+-- The mock's minimap: 140 wide, centered on (100, 100), at an effective scale of 2.
+local function dragTo(button, world, x, y)
+    world.cursorX, world.cursorY = x * 2, y * 2
+    button.scripts.OnDragStart(button)
+    button.scripts.OnUpdate(button)
+    button.scripts.OnDragStop(button)
+end
+
+test("the minimap icon appears at login, on the edge of the minimap", function()
+    Mock.Boot()
+    local button = TradingEssentialsMinimapButton
+    eq(button:IsShown(), true)
+    eq(button.parent, Minimap, "child of the minimap")
+    eq(button.lastPoint.relativeTo, Minimap, "anchored to the minimap")
+    near(button.lastPoint.x, -75 * math.cos(math.rad(45)), 0.01, "x")
+    near(button.lastPoint.y, -75 * math.sin(math.rad(45)), 0.01, "y")
+end)
+
+test("clicking the minimap icon opens and closes the window", function()
+    Mock.Boot()
+    local button = TradingEssentialsMinimapButton
+    button.scripts.OnClick(button, "LeftButton")
+    eq(TradingEssentialsMainFrame:IsShown(), true, "opened")
+    button.scripts.OnClick(button, "LeftButton")
+    eq(TradingEssentialsMainFrame:IsShown(), false, "closed")
+end)
+
+test("dragging the icon follows the cursor around the edge, in any direction", function()
+    local _, world = Mock.Boot()
+    local button = TradingEssentialsMinimapButton
+    local cases = {
+        { x = 300, y = 100, expectX = 75, expectY = 0 }, -- Right, far beyond the edge.
+        { x = 100, y = 130, expectX = 0, expectY = 75 }, -- Above, inside the map.
+        { x = 50, y = 100, expectX = -75, expectY = 0 }, -- Left.
+        { x = 100, y = 50, expectX = 0, expectY = -75 }, -- Below.
+    }
+    for _, case in ipairs(cases) do
+        dragTo(button, world, case.x, case.y)
+        near(button.lastPoint.x, case.expectX, 0.01, "x")
+        near(button.lastPoint.y, case.expectY, 0.01, "y")
+        local angle = TradingEssentialsDB.ui.minimap.angle
+        eq(angle >= 0 and angle < 360, true, "angle in range: " .. angle)
+    end
+end)
+
+test("the icon stops following the cursor once dropped", function()
+    local _, world = Mock.Boot()
+    local button = TradingEssentialsMinimapButton
+    dragTo(button, world, 300, 100)
+    eq(button.scripts.OnUpdate, nil)
+end)
+
+test("the icon keeps its position across a reload", function()
+    local _, world = Mock.Boot()
+    dragTo(TradingEssentialsMinimapButton, world, 300, 100)
+    local saved = TradingEssentialsDB
+
+    Mock.Boot({ db = saved })
+    near(TradingEssentialsMinimapButton.lastPoint.x, 75, 0.01, "x")
+    near(TradingEssentialsMinimapButton.lastPoint.y, 0, 0.01, "y")
+end)
+
+test("the icon's tooltip explains it, but stays out of the way while dragging", function()
+    Mock.Boot()
+    local button = TradingEssentialsMinimapButton
+    button.scripts.OnEnter(button)
+    eq(#GameTooltip.lines, 4, "hints")
+    eq(GameTooltip.text, "Trading Essentials")
+
+    button.scripts.OnDragStart(button)
+    eq(GameTooltip:IsShown(), false, "hidden on drag")
+    button.scripts.OnEnter(button)
+    eq(GameTooltip:IsShown(), false, "not reopened during the drag")
+    button.scripts.OnDragStop(button)
+    button.scripts.OnEnter(button)
+    eq(GameTooltip:IsShown(), true, "back after the drag")
+end)
+
+test("/tradingessentials minimap hides the icon for good, and brings it back", function()
+    local _, world = Mock.Boot()
+    SlashCmdList.TRADINGESSENTIALS("minimap")
+    eq(TradingEssentialsMinimapButton:IsShown(), false, "hidden")
+    eq(#world.printed, 1, "says how to bring it back")
+
+    local saved = TradingEssentialsDB
+    Mock.Boot({ db = saved })
+    eq(TradingEssentialsMinimapButton:IsShown(), false, "still hidden after a reload")
+
+    SlashCmdList.TRADINGESSENTIALS("MINIMAP")
+    eq(TradingEssentialsMinimapButton:IsShown(), true, "shown again")
+end)
+
+test("saved data from before the minimap icon gets it at the default position", function()
+    Mock.Boot({ db = { ui = { position = { point = "CENTER", relativePoint = "CENTER", x = 0, y = 0 } } } })
+    eq(TradingEssentialsMinimapButton:IsShown(), true)
+    eq(TradingEssentialsDB.ui.minimap.angle, 225)
+    eq(TradingEssentialsDB.ui.position.point, "CENTER", "other settings untouched")
+end)
+
+-- Item tooltips ----------------------------------------------------------------
+
+-- The lines Trading Essentials adds when an item is hovered somewhere in the game.
+local function hoverItem(itemID)
+    GameTooltip.lines = {}
+    GameTooltip:SetOwner(UIParent, "ANCHOR_RIGHT")
+    GameTooltip:SetItemByID(itemID)
+    return table.concat(GameTooltip.lines, "\n")
+end
+
+local function has(text, part)
+    return text:find(part, 1, true) ~= nil
+end
+
+test("item tooltips count bound items only when the interface shows them", function()
+    local ns = Mock.Boot()
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(0, 2, 1001, "Herb", 4, { isBound = true })
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    local text = hoverItem(1001)
+    eq(has(text, "Stock=10"), true, "the tradable stock")
+    eq(has(text, "Of which bound"), false)
+
+    ns.Stockpile.SetBoundShown(true)
+    text = hoverItem(1001)
+    eq(has(text, "Stock=14"), true, "bound units too")
+    eq(has(text, "Of which bound=4"), true, "said apart")
+    eq(has(text, "Stock value=1000c"), true, "valued on what can be sold")
+end)
+
+test("looking one item up gives the same row as the whole stock", function()
+    local ns, world = Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(6, 1, 1001, "Herb", 20)
+    Mock.SetBagItem(12, 1, 1001, "Herb", 40)
+    Mock.SetBagItem(0, 2, 1002, "Ore", 3)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    TradingEssentialsDB.characters["Alt-Hyjal"] = {
+        money = 0, stock = { bags = { [1001] = 1 }, bank = {}, mail = { [1001] = 5 } },
+        auctions = {
+            { auctionID = 1, itemID = 1001, qty = 3, expiresAt = world.now + 3600 },
+            { auctionID = 2, itemID = 1001, qty = 50, sold = true, expiresAt = world.now + 3600 },
+            { auctionID = 3, itemID = 1001, qty = 70, expiresAt = world.now - 60 },
+        },
+    }
+    local whole = findRow(ns.Stockpile.GetRows(), 1001)
+    local single = ns.Stockpile.GetItemRow(1001)
+    for _, place in ipairs({ "total", "bags", "bank", "warband", "mail", "auctions" }) do
+        eq(single[place], whole[place], place)
+    end
+    eq(single.total, 79, "sold and ended auctions left out")
+    eq(single.characters["Alt-Hyjal"].auctions, 3, "per character")
+    eq(ns.Stockpile.GetItemRow(4242), nil, "an item not held")
+end)
+
+test("an item's tooltip shows the account's stock, by character and place", function()
+    local _, world = Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.SetBagItem(6, 1, 1001, "Herb", 20)
+    Mock.SetBagItem(12, 1, 1001, "Herb", 40)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    TradingEssentialsDB.characters["Alt-Hyjal"] = {
+        money = 0, class = "WARRIOR", stock = { bags = {}, bank = {}, mail = { [1001] = 5 } },
+        auctions = { { auctionID = 7, itemID = 1001, qty = 3, expiresAt = world.now + 3600 } },
+    }
+    local text = hoverItem(1001)
+    eq(GameTooltip.lines[1], "Stock=78", "the account total first, with no title to save room: " .. text)
+    eq(has(text, "Primo|r=Bags 10, Bank 20"), true, "the player, by place")
+    eq(has(text, "Alt|r=Mail 5, AH 3"), true, "an alt, auctions included")
+    eq(has(text, "Warband bank=40"), true, "the warband bank")
+    eq(has(text, "sale"), false, "no sale lines for an item never sold")
+end)
+
+test("an item's tooltip shows its average sale over 90 days and its last sale", function()
+    local ns, world = Mock.Boot()
+    local day = 86400
+    ns.Ledger.Add({ kind = "sold", t = world.now - 200 * day, itemID = 1001, name = "Herb", qty = 1, gross = 99900 })
+    ns.Ledger.Add({ kind = "sold", t = world.now - day, itemID = 1001, name = "Herb", qty = 1, gross = 400 })
+    -- Collected last, but sent earlier: dates come from the mail.
+    ns.Ledger.Add({ kind = "sold", t = world.now - 10 * day, itemID = 1001, name = "Herb", qty = 2, gross = 200 })
+    ns.Ledger.Add({ kind = "bought", itemID = 1001, name = "Herb", qty = 1, gross = 5 })
+
+    local text = hoverItem(1001)
+    eq(has(text, "Avg. sale (90 days)=200c"), true, "per unit, recent sales only: " .. text)
+    eq(has(text, "Last sale (11/04)=400c"), true, "the latest by date, per unit")
+    eq(has(text, "Stock="), false, "no stock line for an item not held")
+
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 4, gross = 2000 })
+    text = hoverItem(1001)
+    eq(has(text, "Last sale (11/05)=500c"), true, "follows the ledger: " .. text)
+    eq(has(text, "Avg. sale (90 days)=371c"), true, "2600 over 7 units")
+end)
+
+test("an item sold only long ago shows its last sale but no average", function()
+    local ns, world = Mock.Boot()
+    local longAgo = world.now - 200 * 86400
+    ns.Ledger.Add({ kind = "sold", t = longAgo, itemID = 1002, name = "Ore", qty = 2, gross = 1000 })
+    local text = hoverItem(1002)
+    eq(has(text, "Avg. sale"), false, "no recent sale to average: " .. text)
+    eq(has(text, "Last sale (" .. ns.FormatDay(longAgo) .. ")=500c"), true, "the last one")
+end)
+
+test("an item the account never held nor sold gets no lines", function()
+    Mock.Boot()
+    eq(hoverItem(4242), "")
+end)
+
+test("the window's own item tooltips do not get the lines twice", function()
+    local _, list = stockFixture()
+    local row = list.ScrollBox.rendered[1]
+    GameTooltip.lines = {}
+    row.scripts.OnEnter(row)
+    local text = table.concat(GameTooltip.lines, "\n")
+    local _, count = text:gsub("Bags 10, Bank 20", "")
+    eq(count, 1, "holdings listed once")
+end)
+
+test("chat links get the lines, comparison tooltips do not", function()
+    local ns = Mock.Boot()
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    ItemRefTooltip:SetOwner(UIParent, "ANCHOR_PRESERVE")
+    ItemRefTooltip:SetHyperlink("|cffffffff|Hitem:1001::::|h[Herb]|h|r")
+    eq(has(table.concat(ItemRefTooltip.lines, "\n"), "Last sale"), true, "chat link")
+
+    local comparison = Mock.NewTooltip()
+    comparison:SetOwner(GameTooltip, "ANCHOR_NONE")
+    comparison:SetItemByID(1001)
+    eq(#comparison.lines, 0, "comparison tooltip")
+end)
+
+test("/tradingessentials tooltip hides the lines for good, and brings them back", function()
+    local ns, world = Mock.Boot()
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    SlashCmdList.TRADINGESSENTIALS("tooltip")
+    eq(hoverItem(1001), "", "hidden")
+    eq(#world.printed, 1, "says how to bring them back")
+
+    world = select(2, Mock.Boot({ db = TradingEssentialsDB }))
+    eq(hoverItem(1001), "", "still hidden after a reload")
+    SlashCmdList.TRADINGESSENTIALS("TOOLTIP")
+    eq(has(hoverItem(1001), "Last sale"), true, "shown again")
+    eq(#world.printed, 1, "says so")
+end)
+
+-- Auction house scan ----------------------------------------------------------
+
+test("opening the auction house never scans it, and a scan by hand keeps the lowest price per unit", function()
+    local ns, world = Mock.Boot()
+    openAuctionHouse()
+    eq(world.replicateRequests, 0, "only by hand")
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    eq(world.replicateRequests, 1)
+    answerScan({
+        auction(1001, 10, 1000), auction(1001, 5, 400), auction(1001, 1, 150),
+        auction(1002, 1, 0), -- Bids only.
+        auction(1003, 2, 500, 1), -- Already sold.
+        auction(82800, 1, 10), -- A caged pet.
+    })
+    local item = ns.Market.GetItem(1001)
+    eq(item.price, 80, "lowest buyout per unit")
+    eq(item.quantity, 16, "everything on sale")
+    eq(item.seenAt, world.now)
+    eq(ns.Market.GetItem(1002), nil, "no buyout, no price")
+    eq(ns.Market.GetItem(1003), nil, "sold auctions left out")
+    eq(ns.Market.GetItem(82800), nil, "caged pets left out")
+    eq(has(world.printed[#world.printed], "Auction house scanned: 1 items priced."), true, world.printed[#world.printed])
+end)
+
+test("a large auction house is read a few thousand auctions a frame", function()
+    local ns, world = Mock.Boot()
+    scanAuctionHouse()
+    local auctions = {}
+    for i = 1, 5000 do
+        auctions[i] = auction(2000 + i % 50, 1, 100 + i)
+    end
+    Mock.SetReplicate(auctions)
+    Mock.Fire("REPLICATE_ITEM_LIST_UPDATE")
+    eq(world.replicateReads < 5000, true, "not all in one frame")
+    eq(ns.Market.GetItem(2001), nil, "nothing saved before the end")
+    Mock.RunTimers()
+    eq(world.replicateReads, 5000, "each auction read once")
+    eq(ns.Market.GetItem(2001).price, 101)
+    eq(ns.Market.GetItem(2001).quantity, 100)
+end)
+
+test("scans keep the game's 15 minutes apart, and a scan by hand says when it can run", function()
+    local _, world = Mock.Boot()
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 100) })
+    world.now = world.now + 10 * 60
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    eq(world.replicateRequests, 1, "too soon")
+    eq(has(world.printed[#world.printed], "scanned again in 5 min"), true, world.printed[#world.printed])
+
+    world.now = world.now + 5 * 60
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    eq(world.replicateRequests, 2, "allowed again")
+    eq(has(world.printed[#world.printed], "Scanning the auction house..."), true)
+end)
+
+test("a scan request waits for the game's throttle, and one the server dropped is sent again", function()
+    local ns, world = Mock.Boot()
+    world.throttled = true
+    scanAuctionHouse()
+    eq(world.replicateRequests, 0, "held back while the throttle is busy")
+    eq(ns.Market.GetScanState(), "waiting")
+    eq(ns.Market.NextScanAt() <= world.now, true, "the 15 minutes start only once it is sent")
+    world.throttled = false
+    Mock.Fire("AUCTION_HOUSE_THROTTLED_SYSTEM_READY")
+    eq(world.replicateRequests, 1)
+
+    Mock.Fire("AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED")
+    eq(ns.Market.NextScanAt() <= world.now, true, "a dropped request does not count")
+    Mock.Fire("AUCTION_HOUSE_THROTTLED_SYSTEM_READY")
+    eq(world.replicateRequests, 2, "sent again")
+    answerScan({ auction(1001, 1, 100) })
+    eq(ns.Market.GetItem(1001).price, 100)
+    eq(ns.Market.NextScanAt(), world.now + 15 * 60)
+end)
+
+test("an unanswered scan is noticed even when nothing looks at its state", function()
+    local ns, world = Mock.Boot()
+    scanAuctionHouse()
+    Mock.RunTimers() -- The overdue check, too early to expire it.
+    eq(world.replicateRequests, 1)
+    world.now = world.now + 61
+    ns.Market.Scan()
+    eq(world.replicateRequests, 2, "the next scan is not blocked by the lost one")
+end)
+
+test("an error while reading a scan drops it, keeps the previous prices and frees the button", function()
+    local ns, world = Mock.Boot()
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 100) })
+    world.now = world.now + 20 * 60
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    Mock.SetReplicate({ auction(1001, 1, 50), auction(1002, "broken", 10) })
+    local ok, err = pcall(Mock.Fire, "REPLICATE_ITEM_LIST_UPDATE")
+    eq(ok, false, "the error still reaches the game")
+    eq(has(tostring(err), "compare"), true, tostring(err))
+    eq(ns.Market.GetScanState(), nil, "no longer reading")
+    eq(ns.Market.GetItem(1001).price, 100, "previous price kept")
+    eq(has(world.printed[#world.printed], "scan failed"), true, world.printed[#world.printed])
+end)
+
+test("a scan by hand needs the auction house open", function()
+    local _, world = Mock.Boot()
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    eq(world.replicateRequests, 0)
+    eq(has(world.printed[1], "Open the auction house to scan it."), true, world.printed[1])
+end)
+
+test("the setting of the old automatic scan is forgotten", function()
+    Mock.Boot({ db = { ui = { noAutoScan = true } } })
+    eq(TradingEssentialsDB.ui.noAutoScan, nil)
+end)
+
+test("closing the auction house drops a scan in progress and keeps the previous prices", function()
+    local ns, world = Mock.Boot()
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 100) })
+    local firstScan = world.now
+    world.now = world.now + 20 * 60
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    local auctions = {}
+    for i = 1, 5000 do
+        auctions[i] = auction(1001, 1, 50)
+    end
+    Mock.SetReplicate(auctions)
+    Mock.Fire("REPLICATE_ITEM_LIST_UPDATE")
+    Mock.Fire("AUCTION_HOUSE_CLOSED")
+    Mock.RunTimers()
+    eq(ns.Market.GetItem(1001).price, 100, "previous price kept")
+    eq(ns.Market.GetItem(1001).seenAt, firstScan)
+    eq(has(world.printed[#world.printed], "scan stopped"), true, world.printed[#world.printed])
+end)
+
+test("a scan's answer is only read when Trading Essentials asked for it", function()
+    local ns = Mock.Boot()
+    answerScan({ auction(1001, 1, 90) })
+    eq(ns.Market.GetItem(1001), nil, "the auction house is closed")
+
+    openAuctionHouse()
+    answerScan({ auction(1001, 1, 90) })
+    eq(ns.Market.GetItem(1001), nil, "another addon's scan")
+end)
+
+test("a request the server never answers does not block the next one", function()
+    local _, world = Mock.Boot()
+    scanAuctionHouse()
+    eq(world.replicateRequests, 1)
+    world.now = world.now + 16 * 60
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    eq(world.replicateRequests, 2)
+end)
+
+test("items gone from the auction house keep their last price for a month, with none on sale", function()
+    local ns, world = Mock.Boot()
+    scanAuctionHouse()
+    answerScan({ auction(1001, 3, 300), auction(1002, 1, 70) })
+    local firstScan = world.now
+    world.now = world.now + 20 * 60
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    answerScan({ auction(1002, 2, 120) })
+    local gone = ns.Market.GetItem(1001)
+    eq(gone.price, 100, "last price kept")
+    eq(gone.quantity, 0, "none on sale now")
+    eq(gone.seenAt, firstScan)
+    eq(ns.Market.GetItem(1002).price, 60, "replaced by the new scan")
+
+    world.now = world.now + 31 * 86400
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    answerScan({ auction(1002, 1, 80) })
+    eq(ns.Market.GetItem(1001), nil, "dropped after 30 days")
+    eq(ns.Market.GetItem(1002).price, 80)
+end)
+
+test("the account's items keep a price a day, for the change since a week ago", function()
+    local ns, world = Mock.Boot()
+    ns.RememberItem(1001, "Herb", 1, 1)
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 100), auction(1002, 1, 100) })
+    local firstDay = world.now
+    eq(ns.Market.GetChange(1001), nil, "no price a week old yet")
+    for day = 1, 8 do
+        world.now = firstDay + day * 86400
+        SlashCmdList.TRADINGESSENTIALS("scan")
+        answerScan({ auction(1001, 1, 100 + day * 5), auction(1002, 1, 200) })
+    end
+    local change, since = ns.Market.GetChange(1001)
+    near(change, 35 / 105, 0.0001, "against the latest price at least 7 days old")
+    eq(ns.DayKey(since), ns.DayKey(firstDay + 86400))
+    eq(ns.Market.GetChange(1002), nil, "items the account never dealt in keep no history")
+
+    world.now = world.now + 20 * 60
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    answerScan({ auction(1002, 1, 200) })
+    eq(ns.Market.GetChange(1001), nil, "not on sale any more")
+
+    world.now = firstDay + 40 * 86400
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    answerScan({ auction(1001, 1, 100) })
+    local days = 0
+    for _ in pairs(TradingEssentialsDB.market.realms.Hyjal.history[1001]) do
+        days = days + 1
+    end
+    eq(days, 1, "only the last 30 days are kept")
+end)
+
+test("connected realms share their prices", function()
+    Mock.Boot({ connectedRealms = { "Elune" } })
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 100) })
+    local ns = Mock.Boot({ db = TradingEssentialsDB, realm = "Elune", connectedRealms = { "Hyjal" } })
+    eq(ns.Market.GetItem(1001) and ns.Market.GetItem(1001).price, 100, "another realm of the group")
+    ns = Mock.Boot({ db = TradingEssentialsDB, realm = "Ysondre" })
+    eq(ns.Market.GetItem(1001), nil, "a realm outside the group")
+end)
+
+test("without Auctionator, item tooltips give the auction house price, its age and what is on sale", function()
+    local ns, world = Mock.Boot()
+    ns.RememberItem(4242, "Gem", 1, 1)
+    scanAuctionHouse()
+    answerScan({ auction(4242, 4, 1000), auction(4242, 2, 600) })
+    world.now = world.now + 8 * 86400
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    answerScan({ auction(4242, 1, 300) })
+    world.now = world.now + 2 * 3600
+    local text = hoverItem(4242)
+    eq(text ~= "", true, "even for an item neither held nor sold")
+    eq(has(text, "AH price (2 h ago)=300c"), true, "price and age")
+    eq(has(text, "On the AH=1"), true, "quantity on sale")
+    eq(has(text, "Change since 11/05=+20.0%"), true, "change since a week ago")
+    eq(has(text, "Stock value"), false, "nothing held")
+
+    rawset(_G, "Auctionator", { API = { v1 = { GetAuctionPriceByItemID = function() return 999 end } } })
+    text = hoverItem(4242)
+    rawset(_G, "Auctionator", nil)
+    eq(text, "", "Auctionator shows its own price")
+end)
+
+test("item tooltips and the stock tab value the account's stock at the scanned price", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    Mock.Fire("BANKFRAME_CLOSED")
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 30) })
+    eq(has(hoverItem(1001), "Stock value=300c"), true, "in the item's tooltip")
+
+    ns.UI.Open("stock")
+    eq(tables[1].rows[1].value, 300, "in the stock tab")
+    local row = tables[1].ScrollBox.rendered[1]
+    GameTooltip.lines = {}
+    row.scripts.OnEnter(row)
+    local lines = table.concat(GameTooltip.lines, ";")
+    eq(has(lines, "Source: auction house scan of 11/05 12:00"), true, lines)
+end)
+
+test("a finished scan refreshes the open window", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    Mock.Fire("BANKFRAME_CLOSED")
+    ns.UI.Open("stock")
+    eq(tables[1].rows[1].value, nil, "no price yet")
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 30) })
+    eq(tables[1].rows[1].value, 300)
+end)
+
+-- Undercuts -----------------------------------------------------------------------
+
+local function liveAuction(world, auctionID, itemID, unit, options)
+    options = options or {}
+    return {
+        auctionID = auctionID, itemID = itemID, name = "Item " .. itemID, qty = options.qty or 1,
+        unit = unit, sold = options.sold, expiresAt = world.now + 3600,
+    }
+end
+
+local function setAuctions(ns, characterKey, auctions)
+    ns.GetCharacter(characterKey).auctions = auctions
+end
+
+test("after a scan, auctions beaten by a cheaper offer are undercut, and the chat counts them", function()
+    local ns, world = Mock.Boot()
+    local beaten = liveAuction(world, 1, 1001, 100)
+    local cheapest = liveAuction(world, 2, 1002, 50, { qty = 5 })
+    local sold = liveAuction(world, 3, 1003, 10, { sold = true })
+    setAuctions(ns, nil, { beaten, cheapest, sold })
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 90), auction(1001, 1, 100), auction(1002, 5, 250), auction(1003, 1, 5) })
+    local undercut = ns.Auctions.GetUndercut()
+    eq(undercut[beaten], 90, "a cheaper offer")
+    eq(undercut[cheapest], nil, "still the cheapest")
+    eq(undercut[sold], nil, "already sold")
+    eq(has(world.printed[#world.printed], "Undercut auctions: 1."), true, world.printed[#world.printed])
+end)
+
+test("the account's auctions do not undercut each other, on its own auction house only", function()
+    local ns, world = Mock.Boot({ connectedRealms = { "Elune" } })
+    local mine = liveAuction(world, 1, 1001, 100)
+    local alt = liveAuction(world, 2, 1001, 90)
+    local elsewhere = liveAuction(world, 3, 1001, 50)
+    setAuctions(ns, nil, { mine })
+    setAuctions(ns, "Alt-Elune", { alt })
+    setAuctions(ns, "Far-Ysondre", { elsewhere })
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 90), auction(1001, 1, 95), auction(1001, 1, 100) })
+    eq(next(ns.Auctions.GetUndercut()), nil, "the cheapest offer is the account's own")
+
+    world.now = world.now + 20 * 60
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    answerScan({ auction(1001, 1, 85), auction(1001, 1, 90), auction(1001, 1, 100) })
+    local undercut = ns.Auctions.GetUndercut()
+    eq(undercut[mine], 85, "a stranger sells for less")
+    eq(undercut[alt], 85, "an alt on a connected realm too")
+    eq(undercut[elsewhere], nil, "another auction house")
+end)
+
+test("items no longer on sale, or never scanned, are not undercut", function()
+    local ns, world = Mock.Boot()
+    local gone = liveAuction(world, 1, 1001, 100)
+    local unknown = liveAuction(world, 2, 4242, 100)
+    setAuctions(ns, nil, { gone, unknown })
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 50) })
+    eq(ns.Auctions.GetUndercut()[gone], 50)
+
+    world.now = world.now + 20 * 60
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    answerScan({ auction(1002, 1, 50) })
+    local undercut = ns.Auctions.GetUndercut()
+    eq(undercut[gone], nil, "no longer on sale")
+    eq(undercut[unknown], nil, "never scanned")
+    eq(has(world.printed[#world.printed], "Undercut"), false, "nothing to say: " .. world.printed[#world.printed])
+end)
+
+test("the Active list marks undercut auctions, with the cheaper price in their tooltip", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    local segments = captureSegments(ns)
+    setAuctions(ns, nil, { liveAuction(world, 1, 1001, 100), liveAuction(world, 2, 1002, 50) })
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 90), auction(1002, 1, 50) })
+    ns.UI.Open("auctions")
+    segments[1]("active")
+
+    local byItem = {}
+    for _, row in ipairs(tables[1].rows) do
+        byItem[row.itemID] = row
+    end
+    eq(byItem[1001].kindText, "Undercut")
+    eq(byItem[1002].kindText, "On sale")
+    for _, row in ipairs(tables[1].ScrollBox.rendered) do
+        if row.data == byItem[1001] then
+            GameTooltip.lines = {}
+            row.scripts.OnEnter(row)
+        end
+    end
+    local lines = table.concat(GameTooltip.lines, ";")
+    eq(has(lines, "Lowest on the AH=90c"), true, lines)
+    eq(has(lines, "AH scan=11/05 12:00"), true, lines)
+end)
+
+-- Mail summary ------------------------------------------------------------------
+
+test("leaving the mailbox sums up what was collected", function()
+    local _, world = Mock.Boot()
+    world.mails = {
+        soldMail("Herb", 1000, { cut = 50, deposit = 20 }),
+        soldMail("Ore", 500, { cut = 25 }),
+        { subject = "Auction won: Gem", items = { { name = "Gem", id = 1003, count = 1 } },
+            invoice = { type = "buyer", name = "Gem", bid = 300, buyout = 300, deposit = 0, consignment = 0, count = 1 } },
+        { subject = "Auction expired: Herb", items = { { name = "Herb", id = 1001, count = 5 } } },
+        { subject = "Auction expired: Ore", items = { { name = "Ore", id = 1002, count = 2 } } },
+    }
+    Mock.Fire("MAIL_SHOW")
+    for _ = 1, 5 do
+        AutoLootMailItem(1)
+        Mock.CompleteTake()
+    end
+    eq(#world.printed, 0, "nothing said while collecting")
+    Mock.Fire("MAIL_CLOSED")
+    eq(#world.printed, 1)
+    eq(has(world.printed[1], "Collected from the mail: 2 sales, 1445c received; 1 purchases, 300c paid; 2 expired."),
+        true, world.printed[1])
+
+    Mock.Fire("MAIL_SHOW")
+    Mock.Fire("MAIL_CLOSED")
+    eq(#world.printed, 1, "nothing collected, nothing said")
+end)
+
+test("the summary leaves out a take that failed, and only says what there is", function()
+    local _, world = Mock.Boot()
+    world.mails = {
+        { subject = "Auction expired: Herb", items = { { name = "Herb", id = 1001, count = 20 } } },
+        soldMail("Ore", 100),
+    }
+    Mock.Fire("MAIL_SHOW")
+    AutoLootMailItem(1)
+    Mock.FailTake()
+    TakeInboxMoney(2)
+    Mock.CompleteTake()
+    Mock.Fire("MAIL_CLOSED")
+    eq(has(world.printed[1], "Collected from the mail: 1 sales, 100c received."), true, world.printed[1])
+end)
+
+test("the mail summary can be turned off in the settings", function()
+    local _, world = Mock.Boot()
+    Mock.SettingsControl("Mail summary").setting:SetValue(false)
+    world.mails = { soldMail("Herb", 100) }
+    Mock.Fire("MAIL_SHOW")
+    TakeInboxMoney(1)
+    Mock.CompleteTake()
+    Mock.Fire("MAIL_CLOSED")
+    eq(#world.printed, 0)
+    eq(#TradingEssentialsDB.ledger, 1, "the sale is still recorded")
+end)
+
+-- Watch list ----------------------------------------------------------------------
+
+local HERB_LINK = "|cffffffff|Hitem:1001::::|h[Herb]|h|r"
+
+local function lastPrinted(world)
+    return world.printed[#world.printed] or ""
+end
+
+test("prices are read as players write them", function()
+    local ns = Mock.Boot()
+    local cases = {
+        ["12g50s25c"] = 125025, ["50s"] = 5000, ["75c"] = 75, ["12G"] = 120000, ["1g5c"] = 10005,
+        ["12"] = 120000, ["12.5"] = 125000, [".5"] = 5000,
+    }
+    for text, copper in pairs(cases) do
+        eq(ns.Watch.ParseMoney(text), copper, text)
+    end
+    for _, text in ipairs({ "", "abc", "12x", "g", "12g50", "1.2.3" }) do
+        eq(ns.Watch.ParseMoney(text), nil, "refused: " .. text)
+    end
+end)
+
+test("an item is watched by link or by name, with a target to buy, to sell, or both", function()
+    local ns, world = Mock.Boot()
+    ns.RememberItem(1001, "Herb", 1, 1)
+    SlashCmdList.TRADINGESSENTIALS("watch " .. HERB_LINK .. " 12g50s")
+    eq(ns.Watch.Get(1001).below, 125000, "buying is the default")
+    eq(ns.Watch.Get(1001).link, HERB_LINK)
+    eq(has(lastPrinted(world), "Watching " .. HERB_LINK .. ": buy at 125000c or less."), true, lastPrinted(world))
+
+    SlashCmdList.TRADINGESSENTIALS("watch Herb ABOVE 20")
+    eq(ns.Watch.Get(1001).above, 200000)
+    eq(ns.Watch.Get(1001).below, 125000, "the other target stays")
+
+    local newStyle = "|cnIQ3:|Hitem:1002::::|h[Iron Ore Bundle]|h|r"
+    SlashCmdList.TRADINGESSENTIALS("watch " .. newStyle .. " below 1.5")
+    eq(ns.Watch.Get(1002).below, 15000, "a link with spaces and the new colour codes")
+
+    local printed = #world.printed
+    SlashCmdList.TRADINGESSENTIALS("watch")
+    eq(world.printed[printed + 1]:find("Watched items:", 1, true) ~= nil, true)
+    local lines = table.concat(world.printed, "\n", printed + 2)
+    eq(has(lines, HERB_LINK .. ": buy at 125000c or less, sell at 200000c or more, no price yet"), true, lines)
+    eq(has(lines, newStyle .. ": buy at 15000c or less"), true, lines)
+end)
+
+test("watch commands explain what they cannot read", function()
+    local ns, world = Mock.Boot()
+    ns.RememberItem(1001, "Herb", 1, 1)
+    SlashCmdList.TRADINGESSENTIALS("watch")
+    eq(has(lastPrinted(world), "No item is watched."), true, lastPrinted(world))
+    SlashCmdList.TRADINGESSENTIALS("watch Nothing Known 12g")
+    eq(has(lastPrinted(world), "Unknown item."), true, lastPrinted(world))
+    SlashCmdList.TRADINGESSENTIALS("watch Herb twelve")
+    eq(has(lastPrinted(world), "Unknown price."), true, lastPrinted(world))
+    SlashCmdList.TRADINGESSENTIALS("watch " .. HERB_LINK)
+    eq(has(lastPrinted(world), "Unknown price."), true, "a link without a price")
+    eq(next(TradingEssentialsDB.watch), nil, "nothing watched")
+end)
+
+test("unwatch stops watching an item", function()
+    local ns, world = Mock.Boot()
+    ns.RememberItem(1001, "Herb", 1, 1)
+    SlashCmdList.TRADINGESSENTIALS("watch Herb 1g")
+    SlashCmdList.TRADINGESSENTIALS("unwatch " .. HERB_LINK)
+    eq(ns.Watch.Get(1001), nil)
+    eq(has(lastPrinted(world), "Herb is no longer watched."), true, lastPrinted(world))
+    SlashCmdList.TRADINGESSENTIALS("unwatch Herb")
+    eq(has(lastPrinted(world), "Herb is not watched."), true, lastPrinted(world))
+    SlashCmdList.TRADINGESSENTIALS("unwatch Nothing")
+    eq(has(lastPrinted(world), "Unknown item."), true, lastPrinted(world))
+end)
+
+test("each scan says which watched items reach their target", function()
+    local ns, world = Mock.Boot()
+    ns.RememberItem(1001, "Herb", 1, 1)
+    ns.RememberItem(1002, "Ore", 1, 1)
+    ns.RememberItem(1003, "Gem", 1, 1)
+    ns.RememberItem(1004, "Silk", 1, 1)
+    SlashCmdList.TRADINGESSENTIALS("watch Herb 100c")
+    SlashCmdList.TRADINGESSENTIALS("watch Ore above 1g")
+    SlashCmdList.TRADINGESSENTIALS("watch Gem 10c")
+    SlashCmdList.TRADINGESSENTIALS("watch Silk 1g")
+    local printed = #world.printed
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 90), auction(1002, 1, 15000), auction(1003, 1, 50) })
+    local said = table.concat(world.printed, "\n", printed + 1)
+    eq(has(said, "Watched Herb is at 90c: buy at 100c or less."), true, said)
+    eq(has(said, "Watched Ore is at 15000c: sell at 10000c or more."), true, said)
+    eq(has(said, "Watched Gem"), false, "above its buy target")
+    eq(has(said, "Watched Silk"), false, "never on sale")
+
+    world.now = world.now + 20 * 60
+    SlashCmdList.TRADINGESSENTIALS("scan")
+    printed = #world.printed
+    answerScan({ auction(1002, 1, 15000) })
+    said = table.concat(world.printed, "\n", printed + 1)
+    eq(has(said, "Watched Herb"), false, "no longer on sale")
+    eq(has(said, "Watched Ore"), true, "said again while it holds")
+end)
+
+test("item tooltips show the targets of a watched item, even one neither held nor sold", function()
+    local ns = Mock.Boot()
+    ns.RememberItem(4242, "Gem", 1, 1)
+    SlashCmdList.TRADINGESSENTIALS("watch Gem 2g")
+    SlashCmdList.TRADINGESSENTIALS("watch Gem above 5g")
+    local text = hoverItem(4242)
+    eq(has(text, "Buy target=20000c"), true, text)
+    eq(has(text, "Sell target=50000c"), true, text)
+end)
+
+test("a price can be split by spaces, as players often write it", function()
+    local ns, world = Mock.Boot()
+    ns.RememberItem(1001, "Herb", 1, 1)
+    SlashCmdList.TRADINGESSENTIALS("watch Herb 12g 50s")
+    eq(ns.Watch.Get(1001) and ns.Watch.Get(1001).below, 125000, lastPrinted(world))
+    SlashCmdList.TRADINGESSENTIALS("watch " .. HERB_LINK .. " above 1g 5s 25c")
+    eq(ns.Watch.Get(1001).above, 10525, lastPrinted(world))
+    SlashCmdList.TRADINGESSENTIALS("watch Herb below 2g50s 10c")
+    eq(ns.Watch.Get(1001).below, 25010, lastPrinted(world))
+    SlashCmdList.TRADINGESSENTIALS("watch Herb 3 50s")
+    eq(has(lastPrinted(world), "Unknown item."), true, "a bare number is not a coin: " .. lastPrinted(world))
+    eq(ns.Watch.Get(1001).below, 25010, "unchanged")
+end)
+
+-- A fake Auctionator, with its prices and ages by item, and what to call for it to say
+-- that its prices changed, a number of times in a row.
+local function fakeAuctionator(prices, ages)
+    local listeners = {}
+    local addon = { API = { v1 = {
+        GetAuctionPriceByItemID = function(_, itemID) return prices[itemID] end,
+        GetAuctionAgeByItemID = function(_, itemID) return ages[itemID] end,
+        RegisterForDBUpdate = function(caller, callback)
+            eq(caller, "TradingEssentials")
+            table.insert(listeners, callback)
+        end,
+    } } }
+    return addon, function(times)
+        for _ = 1, times or 1 do
+            for _, callback in ipairs(listeners) do
+                callback()
+            end
+        end
+        Mock.RunTimers()
+    end
+end
+
+test("the price on sale now comes from today's scan, or else from what Auctionator saw today", function()
+    local auctionator = fakeAuctionator({ [1001] = 90, [1002] = 80, [1003] = 70, [1004] = 60 },
+        { [1001] = 0, [1002] = 1, [1003] = 0 })
+    local ns, world = Mock.Boot({ auctionator = auctionator })
+    local function offer(itemID)
+        local found = ns.Market.GetOffer(itemID)
+        return found and found.price, found and found.source
+    end
+
+    local price, source = offer(1001)
+    eq(price, 90)
+    eq(source, "auctionator")
+    eq(offer(1002), nil, "seen yesterday: maybe no longer on sale")
+    eq(offer(1004), nil, "no age: too old or never seen")
+
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 50), auction(1005, 1, 40) })
+    price, source = offer(1001)
+    eq(price, 50, "today's scan is the most complete")
+    eq(source, "scan")
+    eq(offer(1003), 70, "Auctionator for what the scan did not see")
+
+    world.now = world.now + 86400
+    price, source = offer(1001)
+    eq(price, 90, "the scan is from yesterday")
+    eq(source, "auctionator")
+    price, source = offer(1005)
+    eq(price, 40, "still the latest word on an item Auctionator does not know")
+    eq(source, "scan")
+end)
+
+test("with Auctionator, its prices check undercuts and watched items, saying only what is new", function()
+    local prices = { [1001] = 90 }
+    local auctionator, update = fakeAuctionator(prices, { [1001] = 0 })
+    local ns, world = Mock.Boot({ auctionator = auctionator })
+    ns.RememberItem(1001, "Herb", 1, 1)
+    local mine = liveAuction(world, 1, 1001, 100)
+    setAuctions(ns, nil, { mine })
+    SlashCmdList.TRADINGESSENTIALS("watch Herb 1g")
+    openAuctionHouse()
+    eq(world.replicateRequests, 0, "opening never scans")
+
+    local printed = #world.printed
+    update()
+    local said = table.concat(world.printed, "\n", printed + 1)
+    eq(ns.Auctions.GetUndercut()[mine], 90)
+    eq(has(said, "Undercut auctions: 1."), true, said)
+    eq(has(said, "Watched Herb is at 90c: buy at 10000c or less."), true, said)
+
+    printed = #world.printed
+    update()
+    eq(#world.printed, printed, "the next search in Auctionator: nothing new to say")
+
+    prices[1001] = 80
+    update(3)
+    eq(#world.printed, printed + 1, "several changes in a row count as one: " .. lastPrinted(world))
+    eq(has(lastPrinted(world), "Watched Herb is at 80c"), true, lastPrinted(world))
+
+    prices[1001] = 20000
+    update()
+    printed = #world.printed
+    prices[1001] = 80
+    update()
+    eq(has(table.concat(world.printed, "\n", printed + 1), "Watched Herb is at 80c"), true, "reached again")
+end)
+
+test("an Auctionator that fails or lacks the newer functions changes nothing", function()
+    local function boom()
+        error("boom")
+    end
+    local ns = Mock.Boot({ auctionator = { API = { v1 = {
+        GetAuctionPriceByItemID = boom, GetAuctionAgeByItemID = boom, RegisterForDBUpdate = boom,
+    } } } })
+    eq(ns.Market.GetOffer(1001), nil)
+    local older = Mock.Boot({ auctionator = { API = { v1 = { GetAuctionPriceByItemID = function() return 5 end } } } })
+    eq(older.Market.GetOffer(1001), nil, "without its age, nothing says it is on sale")
+end)
+
+-- Export ----------------------------------------------------------------------------
+
+local function exportBox()
+    return firstWithin("ScrollFrameTemplate", TradingEssentialsExportFrame).scrollChild
+end
+
+test("the export gives the history as CSV, oldest first, with amounts in copper", function()
+    local ns, world = Mock.Boot()
+    ns.Ledger.Add({ kind = "sold", t = world.now - 3600, itemID = 1001, name = "Herb, fine", qty = 4,
+        gross = 1000, cut = 50, deposit = 10, other = "Bob" })
+    ns.Ledger.Add({ kind = "post", t = world.now - 7200, itemID = 1002, name = 'Ore "raw"', qty = 2,
+        unit = 333, deposit = 20 })
+    SlashCmdList.TRADINGESSENTIALS("export")
+    eq(TradingEssentialsExportFrame:IsShown(), true)
+    local box = exportBox()
+    eq(box:GetText(), table.concat({
+        "date,type,item,item_id,quantity,unit_price,amount,character,other",
+        '2026-11-05 10:00,post,"Ore ""raw""",1002,2,333,-20,Primo-Hyjal,',
+        '2026-11-05 11:00,sold,"Herb, fine",1001,4,250,960,Primo-Hyjal,Bob',
+    }, "\n"))
+    eq(box.highlighted, true, "selected, ready to copy")
+    eq(box.focused, true)
+end)
+
+test("the export box cannot be edited, closes on Escape, and is fresh when reopened", function()
+    local ns, world = Mock.Boot()
+    SlashCmdList.TRADINGESSENTIALS("export")
+    local box = exportBox()
+    local csv = box:GetText()
+    eq(csv, "date,type,item,item_id,quantity,unit_price,amount,character,other", "only the header")
+    box:SetText("typed")
+    box.scripts.OnTextChanged(box, true)
+    eq(box:GetText(), csv, "typing puts the text back")
+    box.scripts.OnEscapePressed(box)
+    eq(TradingEssentialsExportFrame:IsShown(), false)
+
+    ns.Ledger.Add({ kind = "expired", itemID = 1001, name = "Herb", qty = 3 })
+    SlashCmdList.TRADINGESSENTIALS("export")
+    eq(exportBox(), box, "the same window")
+    eq(has(box:GetText(), "expired,Herb,1001,3,,0,Primo-Hyjal,"), true, box:GetText())
+end)
+
+test("the export leaves the amounts of a purchase with an unknown price empty", function()
+    local _, world = Mock.Boot()
+    world.mails = { {
+        subject = "Auction won: Herb (20)",
+        items = { { name = "Herb", id = 1001, count = 20, link = "|Hitem:1001|h[Herb]|h" } },
+    } }
+    Mock.Fire("MAIL_SHOW")
+    AutoLootMailItem(1)
+    SlashCmdList.TRADINGESSENTIALS("export")
+    local csv = exportBox():GetText()
+    eq(has(csv, "\n2026-11-05 12:00,bought,Herb,1001,20,,,Primo-Hyjal,"), true, csv)
+end)
+
+layoutTest("the export hint fits on one line beside the portrait", function()
+    Mock.Boot({ locale = layoutLocale })
+    SlashCmdList.TRADINGESSENTIALS("export")
+    local hint
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "text" and rawget(object, "parent") == TradingEssentialsExportFrame then
+            hint = object
+        end
+    end
+    local rect = Mock.Rect(hint)
+    eq(hint:GetStringWidth() <= rect.right - rect.left, true,
+        ("%.0f wide for %.0f: %s"):format(hint:GetStringWidth(), rect.right - rect.left, hint:GetText()))
+end)
+
+-- Unknown purchase prices ----------------------------------------------------------
+
+-- Keeps the note each tile shows in its corner, by key.
+local function captureTileNotes(ns)
+    local notes = {}
+    local createTile = ns.UI.CreateTile
+    ns.UI.CreateTile = function(parent, spec, width)
+        local tile = createTile(parent, spec, width)
+        local setNote = tile.SetNote
+        tile.SetNote = function(self, text)
+            notes[spec.key] = text
+            setNote(self, text)
+        end
+        return tile
+    end
+    return notes
+end
+
+test("the stats say how many purchases have no price, and average only the priced ones", function()
+    local ns = Mock.Boot()
+    local notes = captureTileNotes(ns)
+    local tables = captureTables(ns)
+    ns.Ledger.Add({ kind = "bought", itemID = 1001, name = "Herb", qty = 10, gross = 500 })
+    ns.UI.Open("stats")
+    eq(notes.spent, "", "every price known")
+
+    ns.Ledger.Add({ kind = "bought", itemID = 1001, name = "Herb", qty = 20 })
+    Mock.RunTimers()
+    eq(notes.spent, "1 unpriced")
+    local row = tables[1].rows[1]
+    eq(row.boughtQty, 30)
+    eq(row.avgPurchase, 50, "the unpriced units do not lower the average")
+end)
+
+test("the history shows a purchase with no price as unknown, not as free", function()
+    local ns = Mock.Boot()
+    local tables = captureTables(ns)
+    local entry = ns.Ledger.Add({ kind = "bought", itemID = 1001, name = "Herb", qty = 20, other = "Alice" })
+    ns.UI.Open("auctions")
+    local rendered
+    for _, row in ipairs(tables[1].ScrollBox.rendered) do
+        if row.data.entry == entry then
+            rendered = row
+        end
+    end
+    eq(rendered.data.unit, nil)
+    eq(rendered.data.amount, nil)
+    GameTooltip.lines = {}
+    rendered.scripts.OnEnter(rendered)
+    local lines = table.concat(GameTooltip.lines, ";")
+    eq(has(lines, "Paid=unknown"), true, lines)
+    eq(has(lines, "The mail's invoice could not be read."), true, lines)
+    eq(has(lines, "Seller=Alice"), true, lines)
+end)
+
+layoutTest("layout: the count of unpriced purchases stays clear of its tile's label", function()
+    local ns, world = layoutFixture()
+    for i = 1, 1000 do
+        ns.Ledger.Add({ kind = "bought", itemID = 5001, name = "An item", qty = 1, t = world.now - i })
+    end
+    ns.UI.Open("stats")
+    local tiles = {}
+    for _, item in ipairs(visibleContent(TradingEssentialsMainFrame)) do
+        local object = item.object
+        if object.kind == "text" then
+            local parent = rawget(object, "parent")
+            tiles[parent] = tiles[parent] or {}
+            tiles[parent][object.font] = item
+        end
+    end
+    local checked = 0
+    for _, texts in pairs(tiles) do
+        local label, note = texts.GameFontNormalSmall, texts.GameFontDisableSmall
+        if label and note and tostring(note.object.text):find("1000", 1, true) then
+            checked = checked + 1
+            eq(overlap(label.rect, note.rect), false,
+                "overlap: " .. describe(label.object, label.rect) .. " and " .. describe(note.object, note.rect))
+        end
+    end
+    eq(checked, 1, "the purchases tile")
+end)
+
+-- Section order --------------------------------------------------------------------
+
+local function orderText(ns, kind)
+    return table.concat(ns.UI.GetOrder(kind), ",")
+end
+
+-- The rows of the order page, by list title then rank. Each has Label, Up and Down.
+local function orderRows(page)
+    local lists = {}
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "frame" and rawget(object, "Up") and Mock.IsWithin(object, page) then
+            local title = rawget(object, "parent").Title:GetText()
+            lists[title] = lists[title] or {}
+            table.insert(lists[title], object)
+        end
+    end
+    return lists
+end
+
+local function frameWithin(template, ancestor)
+    for _, frame in ipairs(Mock.FindFrames(template)) do
+        if Mock.IsWithin(frame, ancestor) then
+            return frame
+        end
+    end
+end
+
+test("an order keeps the known keys, drops the others, and gives new ones their default rank", function()
+    local ns = Mock.Boot()
+    eq(orderText(ns, "tabs"), "stock,auctions,stats,gold", "the default")
+    eq(orderText(ns, "tooltip"), "stock,market,watch,sales,profit")
+    eq(orderText(ns, "tiles"), "net,profit,sales,spent,fees,sellThrough,stockValue,goldChange")
+
+    TradingEssentialsDB.ui.order = { tabs = { "gold", "gone", "stats", "gold" } }
+    eq(orderText(ns, "tabs"), "stock,auctions,gold,stats")
+
+    eq(ns.UI.MoveInOrder("tabs", "stats", -1), true)
+    eq(orderText(ns, "tabs"), "stock,auctions,stats,gold")
+    eq(TradingEssentialsDB.ui.order, nil, "the default order saves nothing")
+    eq(ns.UI.MoveInOrder("tabs", "stock", -1), false, "already first")
+    eq(ns.UI.MoveInOrder("tabs", "gold", 1), false, "already last")
+    eq(ns.UI.MoveInOrder("tabs", "unknown", 1), false)
+end)
+
+-- The scrolled content of the settings page.
+local function settingsContent()
+    local page = Mock.SettingsPage().frame
+    return frameWithin("ScrollFrameTemplate", page).scrollChild
+end
+
+test("the settings page ends with the order of the tabs, tooltip blocks and Stats tiles", function()
+    local ns = Mock.Boot()
+    local page = settingsContent()
+    local header
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "text" and object.text == "Order" and Mock.IsWithin(object, page) then
+            header = object
+        end
+    end
+    eq(header ~= nil, true, "a section of the main page")
+    local lists = orderRows(page)
+    local tabs = lists["Window tabs"]
+    eq(#tabs, 4)
+    eq(#lists["Item tooltips"], 5)
+    eq(#lists["Stats tiles"], 8)
+    eq(lists["Item tooltips"][2].Label:GetText(), "Auction house price")
+    eq(lists["Stats tiles"][8].Label:GetText(), "Gold change")
+
+    eq(tabs[1].Label:GetText(), "Stock")
+    eq(tabs[1].Up.enabled, false, "the first cannot go up")
+    eq(tabs[4].Down.enabled, false, "the last cannot go down")
+    tabs[1].Down.scripts.OnClick(tabs[1].Down)
+    eq(tabs[1].Label:GetText(), "Auctions")
+    eq(tabs[2].Label:GetText(), "Stock")
+    eq(tabs[1].Up.enabled, false)
+    eq(tabs[2].Up.enabled, true)
+    eq(orderText(ns, "tabs"), "auctions,stock,stats,gold", "saved")
+
+    local reset = frameWithin("UIPanelButtonTemplate", page)
+    eq(reset:GetText(), "Default order")
+    eq(reset.enabled, true)
+    reset.scripts.OnClick(reset)
+    eq(tabs[1].Label:GetText(), "Stock")
+    eq(reset.enabled, false, "nothing left to reset")
+    eq(TradingEssentialsDB.ui.order, nil)
+
+    lists["Stats tiles"][3].Up.scripts.OnClick(lists["Stats tiles"][3].Up)
+    Mock.SettingsPage().frame:OnDefault() -- The options panel resetting everything.
+    eq(orderText(ns, "tiles"), "net,profit,sales,spent,fees,sellThrough,stockValue,goldChange",
+        "the options panel's reset")
+end)
+
+test("the window's tabs follow the order, and the first one opens first", function()
+    local ns = Mock.Boot()
+    ns.UI.MoveInOrder("tabs", "stats", -1)
+    ns.UI.MoveInOrder("tabs", "stats", -1)
+    SlashCmdList.TRADINGESSENTIALS("")
+    local frame = TradingEssentialsMainFrame
+    eq(frame.Tabs[1]:GetText(), "Stats")
+    eq(frame.Tabs[2]:GetText(), "Stock")
+    eq(frame.selectedTab, 1, "the first tab opens first")
+    eq(Mock.Rect(frame.Tabs[1]).right < Mock.Rect(frame.Tabs[2]).left, true, "side by side, in order")
+
+    frame.Tabs[2].scripts.OnClick(frame.Tabs[2])
+    eq(frame.selectedTab, 2)
+    ns.UI.MoveInOrder("tabs", "stock", -1)
+    eq(frame.Tabs[1]:GetText(), "Stock", "the open window follows")
+    eq(frame.selectedTab, 1, "the selected tab stays selected at its new rank")
+    eq(Mock.Rect(frame.Tabs[1]).right < Mock.Rect(frame.Tabs[2]).left, true)
+
+    SlashCmdList.TRADINGESSENTIALS("gold")
+    eq(frame.selectedTab, 4, "commands open a tab by name, wherever it stands")
+end)
+
+test("the Stats tiles follow the order, in the open window too", function()
+    local ns = Mock.Boot()
+    local tiles = {}
+    local createTile = ns.UI.CreateTile
+    ns.UI.CreateTile = function(parent, spec, width)
+        tiles[spec.key] = createTile(parent, spec, width)
+        return tiles[spec.key]
+    end
+    ns.UI.MoveInOrder("tiles", "spent", -1)
+    ns.UI.MoveInOrder("tiles", "spent", -1)
+    ns.UI.MoveInOrder("tiles", "spent", -1)
+    ns.UI.Open("stats")
+    local first, second = Mock.Rect(tiles.net), Mock.Rect(tiles.spent)
+    eq(second.left < first.left, true, "purchases before net profit")
+    near(second.top, first.top, 0.01, "on the same row")
+
+    ns.UI.MoveInOrder("tiles", "goldChange", -1)
+    local stock, change = Mock.Rect(tiles.stockValue), Mock.Rect(tiles.goldChange)
+    eq(change.left < stock.left, true, "rearranged in the open window")
+end)
+
+test("item tooltips have no title, and their blocks follow the order", function()
+    local ns = Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    local text = hoverItem(1001)
+    eq(GameTooltip.lines[1], "Stock=10", "no title nor blank line: " .. text)
+    eq(text:find("Stock=", 1, true) < text:find("Last sale", 1, true), true, text)
+
+    for _ = 1, 3 do
+        ns.UI.MoveInOrder("tooltip", "sales", -1)
+    end
+    text = hoverItem(1001)
+    eq(text:find("Last sale", 1, true) < text:find("Stock=", 1, true), true, "sales first: " .. text)
+end)
+
+layoutTest("layout: the order section fits its labels and its row", function()
+    local ns = Mock.Boot({ locale = layoutLocale })
+    local page = settingsContent()
+    local bounds = Mock.Rect(page)
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "text" and Mock.IsWithin(object, page) and object.text ~= "" then
+            local rect = Mock.Rect(object)
+            eq(rect.left >= bounds.left and rect.right <= bounds.right + 0.01 and rect.bottom >= bounds.bottom,
+                true, "outside the page: " .. describe(object, rect))
+            if rawget(rawget(object, "parent"), "Up") then
+                eq(object:GetStringWidth() <= rect.right - rect.left + 0.01, true,
+                    ("label cut: %q"):format(object.text))
+            end
+        end
+    end
+    local reset = frameWithin("UIPanelButtonTemplate", page)
+    eq(reset:GetStringWidth() <= reset.width - 16, true, "button text: " .. reset:GetText())
+    eq(Mock.Rect(reset).bottom >= bounds.bottom, true, "the button fits")
+end)
+
+-- Auction house tab -------------------------------------------------------------------
+
+-- The panel the Trading Essentials tab shows in the auction house window.
+local function auctionHousePanel(ah)
+    for _, object in ipairs(Mock.Objects()) do
+        if rawget(object, "parent") == ah and object.scripts.OnUpdate then
+            return object
+        end
+    end
+end
+
+local function click(button)
+    button.scripts.OnClick(button)
+end
+
+-- A stand-in for LibAHTab that behaves like the library Auctionator brings: its tabs
+-- stand in a line after the game's, which it leaves in their list, and take turns.
+local function installLibAHTab()
+    local library = { tabs = {}, byID = {} }
+    function library:CreateTab(id, attached, text)
+        if not self.root then
+            local tabs = AuctionHouseFrame.Tabs
+            self.root = CreateFrame("Frame", nil, AuctionHouseFrame)
+            self.root:SetSize(10, 10)
+            self.root:SetPoint("TOPLEFT", tabs[#tabs], "TOPRIGHT")
+            hooksecurefunc(AuctionHouseFrame, "SetDisplayMode", function(_, mode)
+                if mode ~= nil and #mode > 0 then
+                    for _, tab in ipairs(self.tabs) do
+                        tab.frameRef:Hide()
+                        PanelTemplates_DeselectTab(tab)
+                    end
+                end
+            end)
+        end
+        local tab = CreateFrame("Button", "LibAHFrame-1.0-" .. id, self.root, "AuctionHouseFrameDisplayModeTabTemplate")
+        tab:SetText(text)
+        local previous = self.tabs[#self.tabs]
+        if previous then
+            tab:SetPoint("TOPLEFT", previous, "TOPRIGHT", 3, 0)
+        else
+            tab:SetPoint("TOPLEFT", self.root, "TOPLEFT", 3, 0)
+        end
+        tab.frameRef = attached
+        attached:Hide()
+        tab:SetScript("OnClick", function()
+            self:SetSelected(id)
+        end)
+        table.insert(self.tabs, tab)
+        self.byID[id] = tab
+    end
+    function library:GetButton(id)
+        return self.byID[id]
+    end
+    function library:SetSelected(id)
+        AuctionHouseFrame:SetDisplayMode({})
+        AuctionHouseFrame.displayMode = nil
+        for _, tab in ipairs(self.tabs) do
+            tab.frameRef:Hide()
+            PanelTemplates_DeselectTab(tab)
+        end
+        for _, tab in ipairs(AuctionHouseFrame.Tabs) do
+            PanelTemplates_DeselectTab(tab)
+        end
+        PanelTemplates_SelectTab(self.byID[id])
+        self.byID[id].frameRef:Show()
+    end
+    rawset(_G, "LibStub", function(major, silent)
+        eq(major, "LibAHTab-1-0")
+        eq(silent, true, "not an error when no addon brings it")
+        return library
+    end)
+    return library
+end
+
+-- The two status lines at the top of the panel, and its scan button.
+local function auctionHouseStatus(panel)
+    local lastScan, state
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "text" and rawget(object, "parent") == panel then
+            if object.font == "GameFontHighlight" then
+                lastScan = object
+            elseif object.font == "GameFontHighlightSmall" then
+                state = object
+            end
+        end
+    end
+    return lastScan:GetText(), state:GetText(), frameWithin("UIPanelButtonTemplate", panel)
+end
+
+test("the Trading Essentials tab comes after the game's and takes turns with them, leaving their list alone", function()
+    Mock.Boot()
+    local ah = Mock.LoadAuctionHouseUI()
+    ah.SetTitle = function(_, title)
+        ah.title = title
+    end
+    eq(#ah.Tabs, 3, "the game's tabs on their own: changing the list taints the bags")
+    eq(ah.numTabs, 3)
+    local tab = TradingEssentialsAuctionHouseTab
+    eq(tab:GetText(), "Trading Essentials")
+    near(Mock.Rect(tab).left, Mock.Rect(ah.Tabs[3]).right + 3, 0.01, "after the last tab")
+    eq(tab.selected, false)
+
+    local panelTemplateCalls = 0
+    local setTab = PanelTemplates_SetTab
+    rawset(_G, "PanelTemplates_SetTab", function(frame, index)
+        panelTemplateCalls = panelTemplateCalls + 1
+        setTab(frame, index)
+    end)
+
+    local panel = auctionHousePanel(ah)
+    eq(panel:IsShown(), false, "until the tab is clicked")
+    click(tab)
+    eq(panel:IsShown(), true)
+    eq(tab.selected, true)
+    eq(ah.Tabs[1].selected, false, "the game's tab is no longer marked")
+    eq(ah.title, "Trading Essentials")
+    eq(ah.displayMode, nil, "so that the game's next mode counts as a change")
+    eq(panelTemplateCalls, 0, "the game's selected tab is not written from here")
+    near(Mock.Rect(panel).top, Mock.Rect(ah).top - 26, 0.01, "below the title bar")
+    near(Mock.Rect(panel).bottom, Mock.Rect(ah).bottom + 27, 0.01, "above the player's money")
+
+    click(ah.Tabs[1])
+    eq(panel:IsShown(), false, "the game's tab takes over")
+    eq(tab.selected, false)
+    eq(ah.selectedTab, 1)
+    eq(ah.Tabs[1].selected, true)
+
+    click(tab)
+    ah:SetDisplayMode(ah.BuyMode) -- What opening the auction house asks for.
+    eq(panel:IsShown(), false, "reopened on the game's first tab")
+    eq(tab.selected, false)
+    eq(ah.Tabs[1].selected, true)
+end)
+
+test("with LibAHTab, as Auctionator brings it, the tab stands in line with the addons' tabs", function()
+    Mock.Boot()
+    local library = installLibAHTab()
+    local ah = Mock.LoadAuctionHouseUI()
+    local shopping = CreateFrame("Frame", nil, ah)
+    library:CreateTab("Shopping", shopping, "Shopping")
+
+    eq(#ah.Tabs, 3, "the game's list stays as it is")
+    eq(rawget(_G, "TradingEssentialsAuctionHouseTab"), nil, "no tab of its own")
+    local ours, theirs = library:GetButton("TradingEssentials"), library:GetButton("Shopping")
+    eq(ours:GetText(), "Trading Essentials")
+    local lastGameTab, oursRect, theirsRect = Mock.Rect(ah.Tabs[3]), Mock.Rect(ours), Mock.Rect(theirs)
+    eq(oursRect ~= nil and theirsRect ~= nil, true, "both have a place")
+    eq(oursRect.left >= lastGameTab.right, true, "after the game's")
+    eq(theirsRect.left >= oursRect.right, true, "side by side")
+
+    local panel = auctionHousePanel(ah)
+    click(ours)
+    eq(panel:IsShown(), true)
+    eq(ours.selected, true)
+    click(theirs)
+    eq(panel:IsShown(), false, "Auctionator's tab takes over")
+    eq(shopping:IsShown(), true)
+    eq(ours.selected, false)
+    click(ours)
+    eq(shopping:IsShown(), false, "and gives way")
+    eq(theirs.selected, false)
+    eq(panel:IsShown(), true)
+    click(ah.Tabs[2])
+    eq(panel:IsShown(), false, "the game's tab too")
+    eq(ours.selected, false)
+end)
+
+test("with Auctionator, the auction house tab lists what its prices show", function()
+    local prices = { [1001] = 90 }
+    local auctionator, update = fakeAuctionator(prices, { [1001] = 0 })
+    local ns, world = Mock.Boot({ auctionator = auctionator })
+    local tables = captureTables(ns)
+    ns.RememberItem(1001, "Herb", 1, 1)
+    setAuctions(ns, nil, { liveAuction(world, 1, 1001, 100) })
+    SlashCmdList.TRADINGESSENTIALS("watch Herb 1g")
+    Mock.LoadAuctionHouseUI()
+    openAuctionHouse()
+    eq(world.replicateRequests, 0, "opening never scans")
+    click(TradingEssentialsAuctionHouseTab)
+
+    local undercut, watched = tables[1], tables[2]
+    eq(undercut.rows[1].lowest, 90)
+    eq(watched.rows[1].price, 90)
+    eq(watched.rows[1].reached, true)
+
+    local row = undercut.ScrollBox.rendered[1]
+    GameTooltip.lines = {}
+    row.scripts.OnEnter(row)
+    local lines = table.concat(GameTooltip.lines, "\n")
+    eq(has(lines, "Source: Auctionator"), true, lines)
+    eq(has(lines, "AH scan"), false, "no scan of ours to date it: " .. lines)
+
+    prices[1001] = 80
+    update()
+    eq(watched.rows[1].price, 80, "follows Auctionator while open")
+end)
+
+test("a scan the server never answers gives its wait back and says so, so the button can scan", function()
+    local ns, world = Mock.Boot()
+    local ah = Mock.LoadAuctionHouseUI()
+    openAuctionHouse()
+    click(TradingEssentialsAuctionHouseTab)
+    local panel = auctionHousePanel(ah)
+    eq(world.replicateRequests, 0, "nothing until the button is pressed")
+    click(select(3, auctionHouseStatus(panel)))
+    eq(world.replicateRequests, 1)
+    local function tick()
+        panel.scripts.OnUpdate(panel, 1)
+        return auctionHouseStatus(panel)
+    end
+    local _, state, button = tick()
+    eq(state, "Scanning the auction house...")
+    eq(button.enabled, false)
+
+    world.now = world.now + 61
+    _, state, button = tick()
+    eq(state, "Ready to scan")
+    eq(button.enabled, true, "the button can try again")
+    eq(has(world.printed[#world.printed], "did not answer the scan"), true, world.printed[#world.printed])
+
+    click(button)
+    eq(world.replicateRequests, 2)
+    answerScan({ auction(1001, 1, 100) })
+    eq(ns.Market.GetItem(1001).price, 100)
+end)
+
+test("the auction house tab shows the scan, the undercut auctions and the watched items", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    ns.RememberItem(1001, "Herb", 1, 1)
+    ns.RememberItem(1002, "Ore", 1, 1)
+    setAuctions(ns, nil, { liveAuction(world, 1, 1001, 100), liveAuction(world, 2, 1002, 40) })
+    SlashCmdList.TRADINGESSENTIALS("watch Ore 1g")
+    SlashCmdList.TRADINGESSENTIALS("watch Herb above 5g")
+    local ah = Mock.LoadAuctionHouseUI()
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 90), auction(1002, 1, 40) })
+    click(TradingEssentialsAuctionHouseTab)
+    local panel = auctionHousePanel(ah)
+
+    local lastScan, state, button = auctionHouseStatus(panel)
+    eq(lastScan, "Last scan: 11/05 12:00")
+    eq(state, "Next scan in 15 min")
+    eq(button:GetText(), "Scan")
+    eq(button.enabled, false, "the game would refuse it")
+
+    local undercut, watched = tables[1], tables[2]
+    eq(#undercut.rows, 1, "only the beaten auction")
+    eq(undercut.rows[1].itemID, 1001)
+    eq(undercut.rows[1].lowest, 90)
+    eq(undercut.rows[1].char, "Primo-Hyjal")
+    eq(#watched.rows, 2)
+    local byItem = {}
+    for _, row in ipairs(watched.rows) do
+        byItem[row.itemID] = row
+    end
+    eq(byItem[1002].price, 40)
+    eq(byItem[1002].reached, true, "below its buy target")
+    eq(byItem[1001].reached, false, "below its sell target")
+
+    world.now = world.now + 15 * 60
+    panel.scripts.OnUpdate(panel, 1)
+    lastScan, state, button = auctionHouseStatus(panel)
+    eq(state, "Ready to scan", "the wait counts down while the panel shows")
+    eq(button.enabled, true)
+    button.scripts.OnClick(button)
+    eq(world.replicateRequests, 2)
+    lastScan, state, button = auctionHouseStatus(panel)
+    eq(state, "Scanning the auction house...")
+    eq(button.enabled, false)
+
+    SlashCmdList.TRADINGESSENTIALS("unwatch Ore")
+    eq(#watched.rows, 1, "the list follows the watch commands")
+end)
+
+test("the auction house tab's item tooltips do not get the lines twice", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    ns.RememberItem(1001, "Herb", 1, 1)
+    Mock.SetBagItem(0, 1, 1001, "Herb", 10)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    eq(has(hoverItem(1001), "Stock=10"), true, "elsewhere, the item gets the lines")
+    setAuctions(ns, nil, { liveAuction(world, 1, 1001, 100) })
+    local ah = Mock.LoadAuctionHouseUI()
+    scanAuctionHouse()
+    answerScan({ auction(1001, 1, 90) })
+    click(TradingEssentialsAuctionHouseTab)
+    local row = tables[1].ScrollBox.rendered[1]
+    GameTooltip.lines = {}
+    row.scripts.OnEnter(row)
+    local text = table.concat(GameTooltip.lines, "\n")
+    eq(has(text, "Stock="), false, "the panel is one of Trading Essentials's own: " .. text)
+    eq(has(text, "Lowest on the AH=90c"), true, text)
+end)
+
+layoutTest("layout: the auction house tab fits its texts", function()
+    local ns = layoutFixture()
+    local tables = captureTables(ns)
+    local ah = Mock.LoadAuctionHouseUI()
+    openAuctionHouse()
+    click(TradingEssentialsAuctionHouseTab)
+    local panel = auctionHousePanel(ah)
+    local bounds = Mock.Rect(panel)
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "text" and rawget(object, "parent") == panel then
+            local rect = Mock.Rect(object)
+            eq(rect.left >= bounds.left and rect.right <= bounds.right, true, "outside the panel: " .. describe(object, rect))
+            eq(object:GetStringWidth() <= rect.right - rect.left + 0.01, true, ("cut: %q"):format(object.text))
+        end
+    end
+    eq(#tables, 5)
+    for _, tbl in ipairs(tables) do
+        local list = Mock.Rect(tbl.ScrollBox)
+        eq(Mock.Rect(tbl).bottom >= bounds.bottom - 0.01, true, "table below the panel")
+        for _, column in ipairs(tbl.columns) do
+            local header, title = Mock.Rect(column.header), Mock.Rect(column.header.Text)
+            eq(header.right <= list.right - 2, true, ("column %s runs into the scroll bar"):format(column.key))
+            eq(title.left >= header.left - 0.01 and title.right <= header.right + 0.01, true,
+                ("title too wide for column %s: %q"):format(column.key, column.header.Text:GetText()))
+        end
+    end
+    local _, _, button = auctionHouseStatus(panel)
+    eq(button:GetStringWidth() <= button.width - 16, true, "button text: " .. button:GetText())
+end)
+
+-- Quick sell --------------------------------------------------------------------------
+
+-- Opens the Trading Essentials tab with the bags as they are, and returns the list of what
+-- can be sold, the game's window and the two boxes for the quantity and the price.
+local function openQuickSell(ns)
+    local tables = captureTables(ns)
+    local ah = Mock.LoadAuctionHouseUI()
+    Mock.Fire("AUCTION_HOUSE_SHOW")
+    Mock.RunTimers()
+    click(TradingEssentialsAuctionHouseTab)
+    local boxes = Mock.FindFrames("InputBoxTemplate")
+    return tables[3], ah, boxes[1], boxes[2]
+end
+
+local function clickRow(list, name)
+    for _, row in ipairs(list.ScrollBox.rendered) do
+        if row.data.name == name then
+            row.scripts.OnClick(row)
+            return row
+        end
+    end
+    error("No row named " .. name)
+end
+
+local function rowNames(list)
+    local names = {}
+    for _, row in ipairs(list.rows) do
+        table.insert(names, row.name .. "=" .. row.qty)
+    end
+    return table.concat(names, ",")
+end
+
+local function selectedRow(list)
+    for _, row in ipairs(list.ScrollBox.rendered) do
+        if row.Selected:IsShown() then
+            return row.data.name
+        end
+    end
+end
+
+-- The text beside a label of the item being sold.
+local function valueBeside(labelText)
+    local label
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "text" and object.text == labelText and object.font == "GameFontNormalSmall" then
+            label = object
+        end
+    end
+    local top = Mock.Rect(label).top
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "text" and object ~= label and rawget(object, "parent") == rawget(label, "parent")
+            and object.font == "GameFontHighlight" and Mock.Rect(object) and math.abs(Mock.Rect(object).top - top) < 0.01 then
+            return object.text
+        end
+    end
+end
+
+-- What the auction house answers for a commodity: { unitPrice, quantity, own? } rows.
+local function answerCommodity(world, itemID, rows)
+    local results = {}
+    for index, row in ipairs(rows) do
+        results[index] = { unitPrice = row[1], quantity = row[2], containsOwnerItem = row[3] or false,
+            owners = { row[3] and "player" or "Someone" } }
+    end
+    world.commodityResults[itemID] = results
+    Mock.Fire("COMMODITY_SEARCH_RESULTS_UPDATED", itemID)
+    Mock.RunTimers()
+end
+
+local function answerItem(world, itemKey, buyouts, own)
+    local results = {}
+    for index, buyout in ipairs(buyouts) do
+        results[index] = {
+            buyoutAmount = buyout or nil, itemKey = itemKey, containsOwnerItem = own or false,
+            auctionID = 900 + index, quantity = 1,
+        }
+    end
+    world.itemResults[itemKey.itemID] = results
+    Mock.Fire("ITEM_SEARCH_RESULTS_UPDATED", itemKey)
+    Mock.RunTimers()
+end
+
+local function press(name)
+    local button = rawget(_G, name)
+    button.scripts.OnClick(button)
+end
+
+local POST, NEXT, PREVIOUS = "TradingEssentialsQuickSellPost", "TradingEssentialsQuickSellNext", "TradingEssentialsQuickSellPrevious"
+
+local function herbAndOre(world)
+    Mock.SetBagItem(0, 1, 1001, "Herb", 20, { commodity = true })
+    Mock.SetBagItem(0, 2, 1001, "Herb", 5, { commodity = true })
+    Mock.SetBagItem(0, 3, 1002, "Ore", 7, { commodity = true })
+    world.money = 1000000
+end
+
+test("quick sell lists what the bags can sell, one row per kind of item", function()
+    local ns = Mock.Boot()
+    Mock.SetBagItem(0, 1, 1001, "Herb", 20, { commodity = true })
+    Mock.SetBagItem(0, 2, 1001, "Herb", 5, { commodity = true })
+    Mock.SetBagItem(1, 1, 2001, "Sword", 1, { itemLevel = 100 })
+    Mock.SetBagItem(1, 2, 2001, "Sword", 1, { itemLevel = 200 })
+    Mock.SetBagItem(1, 3, 2001, "Sword", 1, { itemLevel = 200 })
+    Mock.SetBagItem(2, 1, 3001, "Soulbound", 1, { isBound = true })
+    Mock.SetBagItem(2, 2, 3002, "Quest item", 1, { notSellable = true })
+    Mock.SetBagItem(2, 3, 3003, "Grey rock", 3, { quality = 0 })
+    Mock.SetBagItem(2, 4, 3004, "Grey axe", 1, { quality = 0, equipment = true })
+    Mock.SetBagItem(2, 5, 3005, "On its way", 1, { isLocked = true })
+    Mock.SetBagItem(3, 1, 3006, "Not loaded", 1, { commodityStatus = 0 })
+    Mock.SetBagItem(6, 1, 4001, "In the bank", 1)
+    local list = openQuickSell(ns)
+    eq(rowNames(list), "Grey axe=1,Herb=25,Sword (100)=1,Sword (200)=2")
+end)
+
+test("choosing an item fills in all of it for 48 hours at the lowest price on sale", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    local list, _, quantity, price = openQuickSell(ns)
+    eq(Mock.IsVisible(rawget(_G, POST)), false, "nothing chosen yet: the card is empty")
+
+    clickRow(list, "Herb")
+    eq(selectedRow(list), "Herb")
+    eq(quantity:GetText(), "25", "every stack")
+    eq(#world.searches, 1)
+    eq(world.searches[1].kind, "commodity")
+    eq(world.searches[1].itemKey.itemID, 1001)
+    eq(valueBeside("Lowest on the AH"), "Searching...")
+    eq(rawget(_G, POST).enabled, false, "not before the auction house has answered")
+
+    answerCommodity(world, 1001, { { 90000, 3 }, { 95000, 40 } })
+    eq(valueBeside("Lowest on the AH"), "90000c")
+    eq(price:GetText(), "9g", "the same price")
+    eq(valueBeside("Total"), "2250000c")
+    eq(valueBeside("Deposit"), "300c", "rounded up to the silver, as the game wants")
+    eq(rawget(_G, POST).enabled, true)
+end)
+
+test("posting lists the item as proposed and moves on to the next one", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    local list, _, quantity, price = openQuickSell(ns)
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 90000, 3 }, { 95000, 40 } })
+    press(POST)
+
+    eq(#world.posts, 1)
+    local post = world.posts[1]
+    eq(post.kind, "commodity")
+    eq(post.quantity, 25)
+    eq(post.price, 90000)
+    eq(post.duration, 3, "48 hours")
+    eq(post.location.bag, 0)
+    eq(post.location.slot, 1)
+
+    eq(selectedRow(list), "Ore", "the next item")
+    eq(quantity:GetText(), "7")
+    eq(world.searches[#world.searches].itemKey.itemID, 1002)
+    eq(rawget(_G, POST).enabled, false, "waiting for the next price")
+
+    Mock.Fire("AUCTION_HOUSE_AUCTION_CREATED", 77)
+    local entry = TradingEssentialsDB.ledger[1]
+    eq(entry.kind, "post", "recorded like any listing")
+    eq(entry.unit, 90000)
+    eq(price:GetText(), "", "Ore has no known price yet")
+end)
+
+test("the last item leaves nothing selected, and the setting can keep from moving on", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    Mock.SettingsControl("Next item after posting").setting:SetValue(false)
+    local list = openQuickSell(ns)
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 90000, 3 } })
+    press(POST)
+    eq(selectedRow(list), nil, "stops there when asked to")
+    eq(#world.searches, 1, "no search for another item")
+
+    Mock.SettingsControl("Next item after posting").setting:SetValue(true)
+    clickRow(list, "Ore")
+    answerCommodity(world, 1002, { { 5000, 3 } })
+    press(POST)
+    eq(selectedRow(list), nil, "nothing after the last row")
+end)
+
+test("the next and previous buttons go through the list without posting", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    local list = openQuickSell(ns)
+    clickRow(list, "Herb")
+    eq(rawget(_G, PREVIOUS).enabled, false, "the first row")
+    eq(rawget(_G, NEXT).enabled, true)
+    press(NEXT)
+    eq(selectedRow(list), "Ore")
+    eq(rawget(_G, NEXT).enabled, false, "the last row")
+    press(PREVIOUS)
+    eq(selectedRow(list), "Herb")
+    eq(#world.posts, 0)
+end)
+
+test("the sale duration and proposed price come from the settings, and can change per item", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    eq(Mock.SettingsControl("Sale duration").setting:GetValue(), 48, "two days by default")
+    eq(Mock.SettingsControl("Proposed price").setting:GetValue(), "same", "the same price by default")
+    Mock.SettingsControl("Sale duration").setting:SetValue(24)
+    Mock.SettingsControl("Proposed price").setting:SetValue("percent5")
+    local list, _, _, price = openQuickSell(ns)
+
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 90000, 3 } })
+    eq(price:GetText(), "8g55s", "five percent under")
+    press(POST)
+    eq(world.posts[1].duration, 2, "24 hours")
+
+    answerCommodity(world, 1002, { { 90000, 3, true } })
+    eq(price:GetText(), "9g", "no need to undercut one's own auction")
+
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "text" and object.text == "12 h" then
+            local segment = rawget(object, "parent")
+            segment.scripts.OnClick(segment)
+        end
+    end
+    press(POST)
+    eq(world.posts[2].duration, 1, "12 hours for this one")
+end)
+
+test("proposed prices stay what the game accepts", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    local list, _, _, price = openQuickSell(ns)
+    Mock.SettingsControl("Proposed price").setting:SetValue("gold")
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 5000, 3 } })
+    eq(price:GetText(), "1s", "at least one silver")
+    eq(ns.Selling.NormalizePrice(10050), 10100, "copper rounds up")
+    press(POST)
+    press(POST) -- Far under the lowest price: it takes a second press.
+    eq(world.posts[1].price, 100)
+end)
+
+test("a typed price is kept and read like the watch list's, and an unreadable one cannot post", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    local list, _, quantity, price = openQuickSell(ns)
+    clickRow(list, "Herb")
+    price:SetText("12g 50s")
+    price.scripts.OnTextChanged(price, true)
+    eq(rawget(_G, POST).enabled, true, "a price of one's own need not wait for the search")
+    answerCommodity(world, 1001, { { 90000, 3 } })
+    eq(price:GetText(), "12g 50s", "the answer does not replace it")
+
+    price:SetText("nonsense")
+    price.scripts.OnTextChanged(price, true)
+    eq(rawget(_G, POST).enabled, false)
+    price:SetText("12g5c")
+    price.scripts.OnTextChanged(price, true)
+    eq(rawget(_G, POST).enabled, false, "copper would be silently refused")
+    price:SetText("13g")
+    price.scripts.OnTextChanged(price, true)
+    quantity:SetText("26")
+    quantity.scripts.OnTextChanged(quantity, true)
+    eq(rawget(_G, POST).enabled, false, "more than the bags hold")
+    quantity:SetText("10")
+    quantity.scripts.OnTextChanged(quantity, true)
+    price.scripts.OnEnterPressed(price)
+    eq(world.posts[1].quantity, 10, "Enter posts")
+    eq(world.posts[1].price, 130000)
+end)
+
+test("an item nobody sells starts from what is known of it, or waits for a price", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 50050 })
+    local list, _, _, price = openQuickSell(ns)
+    clickRow(list, "Herb")
+    eq(price:GetText(), "5g1s", "from recent sales, in whole silver")
+    answerCommodity(world, 1001, {})
+    eq(valueBeside("Lowest on the AH"), "None on sale")
+    eq(price:GetText(), "5g1s", "still the best guess")
+    eq(rawget(_G, POST).enabled, true)
+
+    clickRow(list, "Ore")
+    answerCommodity(world, 1002, {})
+    eq(price:GetText(), "")
+    eq(rawget(_G, POST).enabled, false, "no price to post at")
+end)
+
+test("gear searches its own level, posts as an item, and ignores other answers", function()
+    local ns, world = Mock.Boot()
+    world.money = 1000000
+    Mock.SetBagItem(1, 1, 2001, "Sword", 1, { itemLevel = 200 })
+    local list, _, _, price = openQuickSell(ns)
+    clickRow(list, "Sword (200)")
+    local sent = world.searches[1]
+    eq(sent.kind, "item")
+    eq(sent.itemKey.itemLevel, 200)
+
+    answerItem(world, { itemID = 2001, itemLevel = 100, itemSuffix = 0 }, { 500 })
+    eq(valueBeside("Lowest on the AH"), "Searching...", "another level of the same item")
+    answerCommodity(world, 2001, { { 1, 1 } })
+    eq(valueBeside("Lowest on the AH"), "Searching...", "not a commodity")
+
+    answerItem(world, sent.itemKey, { false, 250000 })
+    eq(price:GetText(), "25g", "the first with a buyout")
+    press(POST)
+    eq(world.posts[1].kind, "item")
+    eq(world.posts[1].price, 250000)
+    eq(world.posts[1].bid, nil)
+end)
+
+test("a search waits for the throttle, and is sent again when dropped", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    local list = openQuickSell(ns)
+    world.throttled = true
+    clickRow(list, "Herb")
+    eq(#world.searches, 0, "the server would lose it")
+    world.throttled = false
+    Mock.Fire("AUCTION_HOUSE_THROTTLED_SYSTEM_READY")
+    eq(#world.searches, 1)
+    Mock.Fire("AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED")
+    Mock.Fire("AUCTION_HOUSE_THROTTLED_SYSTEM_READY")
+    eq(#world.searches, 2, "dropped, so asked again")
+
+    world.throttled = true
+    answerCommodity(world, 1001, { { 90000, 3 } })
+    eq(rawget(_G, POST).enabled, false, "a listing has to wait too")
+    world.throttled = false
+    Mock.Fire("AUCTION_HOUSE_THROTTLED_SYSTEM_READY")
+    eq(rawget(_G, POST).enabled, true)
+end)
+
+test("a suspicious price takes a second press, whatever made it suspicious", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    world.vendorPrices[1002] = 2000
+    local list, _, _, price = openQuickSell(ns)
+
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 100, 1 }, { 90000, 100 } })
+    eq(price:GetText(), "1s")
+    press(POST)
+    eq(#world.posts, 0, "one cheap unit sets the lowest price, far under the usual one")
+    eq(rawget(_G, POST):GetText(), "Confirm")
+    price:SetText("80g")
+    price.scripts.OnTextChanged(price, true)
+    eq(rawget(_G, POST):GetText(), "Post", "changing the price starts over")
+    press(POST)
+    eq(#world.posts, 1, "a normal price needs no confirmation")
+
+    clickRow(list, "Ore")
+    answerCommodity(world, 1002, { { 2000, 500 } })
+    press(POST)
+    eq(#world.posts, 1, "the auction house's cut would make it worth less than the vendor gives")
+    press(POST)
+    eq(#world.posts, 2)
+end)
+
+test("a listing the game wants confirmed goes to the game's own dialog", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    world.postNeedsConfirmation = true
+    local list = openQuickSell(ns)
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 90000, 3 } })
+    press(POST)
+    eq(world.pendingPost.kind, "commodity")
+    eq(world.pendingPost[2], 3, "the duration")
+    eq(world.pendingPost[3], 25, "the quantity")
+    eq(world.pendingPost[4], 90000, "the price")
+end)
+
+test("the list follows the bags, and a chosen item that left them is let go", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    local list, _, quantity = openQuickSell(ns)
+    clickRow(list, "Herb")
+    world.bags[0][2] = nil
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    eq(rowNames(list), "Herb=20,Ore=7")
+    eq(quantity:GetText(), "20", "no more than what is left")
+    eq(selectedRow(list), "Herb")
+
+    world.bags[0][1] = nil
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    eq(rowNames(list), "Ore=7")
+    eq(selectedRow(list), nil)
+end)
+
+test("nothing else is listed during a multiple listing, which stops when leaving the view", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    local cancels = 0
+    local list = openQuickSell(ns)
+    local cancelSell = C_AuctionHouse.CancelSell
+    C_AuctionHouse.CancelSell = function()
+        cancels = cancels + 1
+        cancelSell()
+    end
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 90000, 3 } })
+    eq(rawget(_G, POST).enabled, true)
+    Mock.Fire("AUCTION_MULTISELL_START")
+    eq(rawget(_G, POST).enabled, false, "the game would refuse it")
+    Mock.Fire("AUCTION_MULTISELL_UPDATE", 1, 3)
+    eq(rawget(_G, POST).enabled, false, "one of three")
+    Mock.Fire("AUCTION_MULTISELL_UPDATE", 3, 3)
+    eq(rawget(_G, POST).enabled, true, "done")
+    Mock.Fire("AUCTION_MULTISELL_START")
+    Mock.Fire("AUCTION_MULTISELL_FAILURE")
+    eq(rawget(_G, POST).enabled, true, "failed: over too")
+    eq(cancels, 0)
+
+    Mock.Fire("AUCTION_MULTISELL_START")
+    click(AuctionHouseFrame.Tabs[1])
+    eq(cancels, 1, "left the view during it")
+    click(AuctionHouseFrame.Tabs[2])
+    eq(cancels, 1, "only once")
+end)
+
+test("a listing that locks an item takes it off the list until it comes back", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    local list = openQuickSell(ns)
+    world.bags[0][3].isLocked = true
+    Mock.Fire("ITEM_LOCK_CHANGED", 0, 3)
+    Mock.RunTimers()
+    eq(rowNames(list), "Herb=25")
+    world.bags[0][3].isLocked = false
+    Mock.Fire("ITEM_LOCK_CHANGED", 0, 3)
+    Mock.RunTimers()
+    eq(rowNames(list), "Herb=25,Ore=7")
+end)
+
+test("the keys work while the view shows, unless turned off, and wait for combat to end", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    openQuickSell(ns)
+    eq(world.bindings.SPACE, "CLICK " .. POST .. ":LeftButton")
+    eq(world.bindings["SHIFT-SPACE"], "CLICK " .. NEXT .. ":LeftButton")
+    eq(world.bindings.BACKSPACE, "CLICK " .. PREVIOUS .. ":LeftButton")
+
+    local ah = AuctionHouseFrame
+    world.inCombat = true
+    click(ah.Tabs[1])
+    eq(world.bindings.SPACE ~= nil, true, "cannot change in combat")
+    world.inCombat = false
+    Mock.Fire("PLAYER_REGEN_ENABLED")
+    eq(next(world.bindings), nil, "released once it is over: Space must jump again")
+
+    click(TradingEssentialsAuctionHouseTab)
+    eq(world.bindings.SPACE ~= nil, true)
+    Mock.SettingsControl("Trading Essentials tab keys").setting:SetValue(false)
+    eq(next(world.bindings), nil, "turned off")
+end)
+
+test("the tracking view replaces quick selling and releases the keys", function()
+    local ns, world = Mock.Boot()
+    herbAndOre(world)
+    local list = openQuickSell(ns)
+    local function segment(label)
+        for _, object in ipairs(Mock.Objects()) do
+            if object.kind == "text" and object.text == label then
+                return rawget(object, "parent")
+            end
+        end
+    end
+    local tracking = segment("Tracking")
+    eq(Mock.IsVisible(list), true)
+    tracking.scripts.OnClick(tracking)
+    eq(Mock.IsVisible(list), false)
+    eq(next(world.bindings), nil, "the keys are only taken while selling")
+    local sell = segment("Quick sell")
+    sell.scripts.OnClick(sell)
+    eq(Mock.IsVisible(list), true)
+    eq(world.bindings.SPACE ~= nil, true)
+end)
+
+layoutTest("layout: quick selling fits its labels and buttons", function()
+    local ns, world = layoutFixture()
+    local list = openQuickSell(ns)
+    local first = list.ScrollBox.rendered[1]
+    first.scripts.OnClick(first)
+    answerItem(world, first.data.itemKey, { 99999990000 })
+    local card = Mock.Rect(rawget(rawget(rawget(_G, POST), "parent"), "parent"))
+    local texts = {}
+    for _, object in ipairs(Mock.Objects()) do
+        local parent = rawget(object, "parent")
+        -- The item's name is cut on purpose, like the names in every list.
+        if object.kind == "text" and parent == rawget(rawget(_G, POST), "parent") and object.font ~= "GameFontNormal"
+            and Mock.IsVisible(object) and object.text ~= "" then
+            local rect = Mock.Rect(object)
+            eq(rect.left >= card.left and rect.right <= card.right + 0.01, true, "outside the card: " .. describe(object, rect))
+            eq(object:GetStringWidth() <= rect.right - rect.left + 0.01, true, ("cut: %q"):format(object.text))
+            table.insert(texts, { object = object, rect = rect })
+        end
+    end
+    for i = 1, #texts do
+        for j = i + 1, #texts do
+            eq(overlap(texts[i].rect, texts[j].rect), false,
+                "overlap: " .. describe(texts[i].object, texts[i].rect) .. " and " .. describe(texts[j].object, texts[j].rect))
+        end
+    end
+    for _, name in ipairs({ POST, NEXT, PREVIOUS }) do
+        local button = rawget(_G, name)
+        eq(button:GetStringWidth() <= button.width - 16, true, "button text: " .. button:GetText())
+    end
+    press(POST)
+    local second = list.rows[2]
+    world.vendorPrices[second.itemID] = 500000
+    answerItem(world, second.itemKey, { 1000 })
+    local warning
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "text" and object.text == ns.L["Below the vendor price"] then
+            warning = object
+        end
+    end
+    eq(warning ~= nil, true, "a warning shows")
+    press(POST)
+    local rect = Mock.Rect(warning)
+    eq(warning:GetStringWidth() <= 2 * (rect.right - rect.left), true, ("too long for two lines: %q"):format(warning.text))
+end)
+
+-- Shopping list -------------------------------------------------------------------------
+
+local FINISHING = 2
+local BUY = "TradingEssentialsShoppingBuy"
+
+-- Tracks a recipe. slots: { item or list of qualities, quantity, reagent type? }.
+local function trackRecipe(world, recipeID, name, outputItemID, slots, options)
+    options = options or {}
+    local schematics = {}
+    for index, slot in ipairs(slots) do
+        local reagents = {}
+        for tier, itemID in ipairs(type(slot[1]) == "table" and slot[1] or { slot[1] }) do
+            reagents[tier] = { itemID = itemID }
+        end
+        schematics[index] = {
+            reagents = reagents, quantityRequired = slot[2], reagentType = slot[3] or 1, variableQuantities = slot[4] or {},
+        }
+    end
+    world.recipes[recipeID] = {
+        name = name, icon = 1, outputItemID = outputItemID, quantityMin = options.outputQuantity or 1,
+        reagentSlotSchematics = schematics,
+    }
+    table.insert(options.recraft and world.trackedRecrafts or world.trackedRecipes, recipeID)
+end
+
+local function clickText(text)
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "frame" and rawget(object, "frameType") == "Button" and rawget(object, "text") == text
+            and object.scripts.OnClick then
+            object.scripts.OnClick(object)
+            return object
+        end
+    end
+    error("No button reading " .. text)
+end
+
+-- Opens the Purchases view, and returns the recipes, the list and the game's window.
+local function openShopping(ns)
+    local tables = captureTables(ns)
+    local ah = Mock.LoadAuctionHouseUI()
+    Mock.Fire("AUCTION_HOUSE_SHOW")
+    Mock.RunTimers()
+    click(TradingEssentialsAuctionHouseTab)
+    for _, object in ipairs(Mock.Objects()) do
+        local parent = rawget(object, "parent")
+        if object.kind == "text" and object.text == ns.L["Purchases"] and parent and rawget(parent, "Underline") then
+            click(parent)
+        end
+    end
+    Mock.RunTimers()
+    return tables[4], tables[5], ah
+end
+
+local function refreshShopping()
+    Mock.RunTimers()
+end
+
+-- Each component as name=need/have/buy.
+local function listText(list)
+    local parts = {}
+    for _, row in ipairs(list.rows) do
+        table.insert(parts, tostring(row.name or row.itemID) .. "=" .. row.need .. "/" .. row.have .. "/" .. row.buy)
+    end
+    return table.concat(parts, ",")
+end
+
+local function shoppingRow(list, itemID)
+    for _, row in ipairs(list.rows) do
+        if row.itemID == itemID then
+            return row
+        end
+    end
+end
+
+local function textShowing(part)
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "text" and has(tostring(object.text), part) and Mock.IsVisible(object) then
+            return object.text
+        end
+    end
+end
+
+local function remember(ns)
+    for itemID, name in pairs({ [1001] = "Herb", [1002] = "Ore", [1003] = "Gem", [5001] = "Flask", [6001] = "Soul dust" }) do
+        ns.RememberItem(itemID, name, 1, 1)
+    end
+end
+
+local function shoppingBoxes()
+    local boxes = Mock.FindFrames("InputBoxTemplate")
+    return boxes[3], boxes[4]
+end
+
+test("the list holds the components of the tracked recipes, not what they make", function()
+    local ns, world = Mock.Boot()
+    remember(ns)
+    world.itemBinds[6001] = 1
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 2 }, { 1002, 1 }, { 6001, 1 }, { 9999, 1, FINISHING } })
+    trackRecipe(world, 12, "Make cauldron", 5002, { { 5001, 3 }, { 1001, 1 } })
+    local recipes, list = openShopping(ns)
+    eq(#recipes.rows, 2)
+    eq(listText(list), "Flask=3/1/2,Herb=3/0/3,Ore=1/0/1",
+        "no cauldron, no bound or optional component, and the flask as a component, less the one made")
+end)
+
+test("what is already held comes off the list, for this character or the whole account", function()
+    local ns, world = Mock.Boot()
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 10 } })
+    Mock.SetBagItem(0, 1, 1001, "Herb", 2)
+    Mock.SetBagItem(12, 1, 1001, "Herb", 1)
+    Mock.Fire("BANKFRAME_OPENED")
+    Mock.RunTimers()
+    Mock.Fire("BANKFRAME_CLOSED")
+    TradingEssentialsDB.characters["Alt-Hyjal"] = {
+        money = 0, stock = { bags = { [1001] = 5 }, bank = {}, mail = {} },
+        auctions = { { auctionID = 1, itemID = 1001, qty = 4, expiresAt = world.now + 3600 } },
+    }
+    local _, list = openShopping(ns)
+    eq(listText(list), "Herb=10/3/7", "the character and the Warband bank")
+    Mock.SettingsControl("Stock counted for purchases").setting:SetValue("account")
+    refreshShopping()
+    eq(listText(list), "Herb=10/8/2", "the alt's bags too, but not what is on sale")
+end)
+
+test("a bound component held comes off the list too", function()
+    local ns, world = Mock.Boot()
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 10 } })
+    Mock.SetBagItem(0, 1, 1001, "Herb", 2)
+    Mock.SetBagItem(0, 2, 1001, "Herb", 3, { isBound = true })
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    local _, list = openShopping(ns)
+    eq(listText(list), "Herb=10/5/5", "bound or not, it serves the craft")
+end)
+
+test("the number of crafts multiplies the list, and zero takes a recipe off it", function()
+    local ns, world = Mock.Boot()
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 2 } })
+    local _, list = openShopping(ns)
+    clickText("+")
+    refreshShopping()
+    eq(listText(list), "Herb=4/0/4")
+    eq(TradingEssentialsDB.ui.shoppingCrafts["11"], 2, "kept for next time")
+
+    local crafts = shoppingBoxes()
+    eq(crafts:GetText(), "2")
+    crafts:SetText("5")
+    crafts.scripts.OnTextChanged(crafts, true)
+    refreshShopping()
+    eq(listText(list), "Herb=10/0/10")
+
+    crafts:SetText("0")
+    crafts.scripts.OnTextChanged(crafts, true)
+    refreshShopping()
+    eq(listText(list), "")
+    clickText("-")
+    refreshShopping()
+    eq(listText(list), "", "never below zero")
+end)
+
+test("the quality bought is the cheapest or the best, and every quality held counts", function()
+    local auctionator = fakeAuctionator({ [1001] = 300, [1002] = 100, [1003] = 900 }, {})
+    local ns, world = Mock.Boot({ auctionator = auctionator })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { { 1001, 1002, 1003 }, 4 } })
+    Mock.SetBagItem(0, 1, 1003, "Gem", 1)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    local _, list = openShopping(ns)
+    eq(list.rows[1].itemID, 1002, "the cheapest")
+    eq(list.rows[1].buy, 3, "the one of another quality counts")
+    eq(list.rows[1].cost, 300)
+    Mock.SettingsControl("Component quality").setting:SetValue("highest")
+    refreshShopping()
+    eq(list.rows[1].itemID, 1003)
+end)
+
+test("a quality that takes another quantity is counted with it, and currencies are left out", function()
+    local ns, world = Mock.Boot()
+    remember(ns)
+    world.recipes[11] = { name = "Make flask", icon = 1, outputItemID = 5001, quantityMin = 1, reagentSlotSchematics = {
+        { reagents = { { itemID = 1001 } }, quantityRequired = 2, reagentType = 1,
+            variableQuantities = { { reagent = { itemID = 1001 }, quantity = 7 } } },
+        { reagents = { { currencyID = 3000 } }, quantityRequired = 5, reagentType = 1, variableQuantities = {} },
+    } }
+    table.insert(world.trackedRecipes, 11)
+    local _, list = openShopping(ns)
+    eq(listText(list), "Herb=7/0/7")
+end)
+
+test("a recipe shows what a craft costs and earns once the cut is taken", function()
+    local auctionator = fakeAuctionator({ [1001] = 100, [5001] = 1000 }, {})
+    local ns, world = Mock.Boot({ auctionator = auctionator })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 2 } }, { outputQuantity = 2 })
+    trackRecipe(world, 12, "No price", 5002, { { 1002, 1 } })
+    local recipes = openShopping(ns)
+    local byKey = {}
+    for _, recipe in ipairs(recipes.rows) do
+        byKey[recipe.key] = recipe
+    end
+    eq(byKey["11"].cost, 200)
+    eq(byKey["11"].value, 1900, "two sold, less five percent")
+    eq(byKey["11"].margin, 1700)
+    eq(byKey["12"].margin, nil, "nothing known of its price")
+end)
+
+test("recent sales suggest how many to craft, for a week's worth beyond the stock", function()
+    local ns, world = Mock.Boot()
+    remember(ns)
+    ns.Ledger.Add({ kind = "sold", itemID = 5001, name = "Flask", qty = 20, gross = 100, t = world.now - 3 * 86400 })
+    ns.Ledger.Add({ kind = "sold", itemID = 5001, name = "Flask", qty = 500, gross = 100, t = world.now - 20 * 86400 })
+    Mock.SetBagItem(0, 1, 5001, "Flask", 3)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 1 } }, { outputQuantity = 2 })
+    trackRecipe(world, 12, "Never sold", 5002, { { 1002, 1 } })
+    local recipes, list = openShopping(ns)
+    clickText("Based on my sales")
+    refreshShopping()
+    eq(listText(list), "Herb=4/0/4,Ore=1/0/1", "seven more to have ten, by twos, and one left alone")
+    eq(recipes.rows[1].suggested ~= nil, true)
+end)
+
+test("buying asks for the exact price, then confirms it, and moves on to the next component", function()
+    local ns, world = Mock.Boot({ money = 100000000 })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 5 }, { 1002, 2 } })
+    local _, list = openShopping(ns)
+    local buy = rawget(_G, BUY)
+    eq(buy.enabled, false, "nothing chosen yet")
+
+    clickRow(list, "Herb")
+    local _, quantity = shoppingBoxes()
+    eq(quantity:GetText(), "5")
+    eq(world.searches[#world.searches].kind, "commodity")
+    eq(world.searches[#world.searches].itemKey.itemID, 1001)
+    eq(buy.enabled, false, "not before the auction house has answered")
+
+    answerCommodity(world, 1001, { { 100, 3 }, { 110, 40 } })
+    eq(has(textShowing("Lowest"), "Lowest 100c, average 104c, total 520c"), true, textShowing("Lowest"))
+    press(BUY)
+    eq(world.purchaseSteps[1], "start 1001 x5")
+    eq(buy.enabled, false, "waiting for the exact price")
+
+    Mock.Fire("COMMODITY_PRICE_UPDATED", 105, 525)
+    eq(buy:GetText(), "Confirm")
+    eq(has(textShowing("Exact total"), "525c"), true, textShowing("Exact total"))
+    press(BUY)
+    eq(world.purchaseSteps[2], "confirm 1001 x5")
+
+    Mock.Fire("COMMODITY_PURCHASED", 1001, 5)
+    Mock.Fire("COMMODITY_PURCHASE_SUCCEEDED")
+    eq(selectedRow(list), "Ore", "the next component to buy")
+    eq(quantity:GetText(), "2")
+    refreshShopping()
+    eq(shoppingRow(list, 1001).buy, 0, "what was bought is on its way in the mail")
+end)
+
+test("moving on after a purchase skips what is already covered", function()
+    local ns, world = Mock.Boot({ money = 100000000 })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 1 }, { 1002, 1 }, { 1003, 1 } })
+    Mock.SetBagItem(0, 1, 1002, "Ore", 1)
+    Mock.Fire("BAG_UPDATE_DELAYED")
+    Mock.RunTimers()
+    local _, list = openShopping(ns)
+    clickRow(list, "Gem")
+    answerCommodity(world, 1003, { { 100, 3 } })
+    press(BUY)
+    Mock.Fire("COMMODITY_PRICE_UPDATED", 100, 100)
+    press(BUY)
+    Mock.Fire("COMMODITY_PURCHASE_SUCCEEDED")
+    eq(selectedRow(list), "Herb", "Ore is covered")
+end)
+
+test("a quantity that climbs into dearer auctions takes a second press, or a good price", function()
+    local ns, world = Mock.Boot({ money = 100000000 })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 10 } })
+    local _, list = openShopping(ns)
+    local _, quantity = shoppingBoxes()
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 100, 2 }, { 1000, 20 } })
+    eq(textShowing("The price climbs") ~= nil, true)
+    press(BUY)
+    eq(#world.purchaseSteps, 0, "one more press")
+    eq(rawget(_G, BUY):GetText(), "Confirm")
+
+    clickText("Good price: 2")
+    eq(quantity:GetText(), "2", "only what is at a good price")
+    eq(rawget(_G, BUY):GetText(), "Buy", "nothing left to warn about")
+    press(BUY)
+    eq(world.purchaseSteps[1], "start 1001 x2")
+end)
+
+test("buying stays within what is on sale and what the player can pay, and skips their own", function()
+    local ns, world = Mock.Boot({ money = 1000 })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 50 } })
+    local _, list = openShopping(ns)
+    local _, quantity = shoppingBoxes()
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 50, 3, true }, { 100, 5 } })
+    eq(quantity:GetText(), "5", "what can be bought, one's own auctions aside")
+    eq(has(textShowing("Lowest"), "Lowest 100c"), true, textShowing("Lowest"))
+    eq(rawget(_G, BUY).enabled, true)
+
+    quantity:SetText("8")
+    quantity.scripts.OnTextChanged(quantity, true)
+    eq(textShowing("Only 5 on sale") ~= nil, true)
+    eq(rawget(_G, BUY).enabled, false)
+
+    quantity:SetText("5")
+    quantity.scripts.OnTextChanged(quantity, true)
+    world.money = 10
+    quantity.scripts.OnTextChanged(quantity, true)
+    eq(rawget(_G, BUY).enabled, false, "not enough gold")
+end)
+
+test("an item sold by the unit is bought one auction at a time, at its buyout", function()
+    local ns, world = Mock.Boot({ money = 1000000 })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 2 }, { 1002, 1 } })
+    local _, list = openShopping(ns)
+    local _, quantity = shoppingBoxes()
+    local key = { itemID = 1001, itemLevel = 0, itemSuffix = 0 }
+    clickRow(list, "Herb")
+    answerItem(world, key, { 700, 500, false })
+    eq(has(textShowing("Cheapest"), "Cheapest: 1 for 500c"), true, textShowing("Cheapest"))
+    press(BUY)
+    eq(#world.purchaseSteps, 0, "its price is shown first")
+    eq(rawget(_G, BUY):GetText(), "Confirm")
+    eq(has(textShowing("Exact total"), "500c"), true)
+    press(BUY)
+    eq(world.purchaseSteps[1], "bid 902 for 500", "the cheapest, at its buyout")
+
+    Mock.Fire("AUCTION_HOUSE_PURCHASE_COMPLETED", 902)
+    eq(quantity:GetText(), "1", "one more to buy")
+    eq(selectedRow(list), "Herb")
+    answerItem(world, key, { 700 })
+    press(BUY)
+    press(BUY)
+    eq(world.purchaseSteps[2], "bid 901 for 700")
+    Mock.Fire("AUCTION_HOUSE_SHOW_ERROR", 1)
+    eq(selectedRow(list), "Herb", "a refusal looks again")
+
+    answerItem(world, key, { 700 })
+    press(BUY)
+    press(BUY)
+    Mock.Fire("AUCTION_HOUSE_PURCHASE_COMPLETED", 901)
+    eq(selectedRow(list), "Ore", "done with it")
+    Mock.RunTimers()
+    eq(ns.Stockpile.GetItemRow(1001).mail, 2, "both on their way in the mail, not the refused one")
+end)
+
+test("one's own auctions of an item sold by the unit are not bought", function()
+    local ns, world = Mock.Boot({ money = 1000000 })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 1 } })
+    local _, list = openShopping(ns)
+    clickRow(list, "Herb")
+    answerItem(world, { itemID = 1001, itemLevel = 0, itemSuffix = 0 }, { 500 }, true)
+    eq(textShowing("None on sale") ~= nil, true)
+    eq(rawget(_G, BUY).enabled, false)
+end)
+
+test("a component a tracked recipe makes for less says so, with what a unit costs to craft", function()
+    local auctionator = fakeAuctionator({ [1001] = 100, [5001] = 500 }, {})
+    local ns, world = Mock.Boot({ auctionator = auctionator, money = 1000000 })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 2 } })
+    trackRecipe(world, 12, "Make cauldron", 5002, { { 5001, 3 } })
+    local _, list = openShopping(ns)
+    eq(shoppingRow(list, 5001).craftUnit, 200)
+    eq(shoppingRow(list, 1001).craftUnit, nil, "no recipe makes it")
+
+    local row = clickRow(list, "Flask")
+    answerCommodity(world, 5001, { { 500, 10 } })
+    eq(has(tostring(textShowing("Cheaper to craft")), "200c each"), true, tostring(textShowing("Cheaper to craft")))
+    eq(rawget(_G, BUY).enabled, true, "buying stays possible")
+    GameTooltip.lines = {}
+    row.scripts.OnEnter(row)
+    local lines = table.concat(GameTooltip.lines, " | ")
+    eq(has(lines, "Craft cost per unit=200c"), true, lines)
+end)
+
+test("a price well above a component's usual price takes a second press", function()
+    local ns, world = Mock.Boot({ money = 100000000 })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 1 } })
+    scanAuctionHouse()
+    for _ = 1, 3 do
+        answerScan({ auction(1001, 1, 100) })
+        world.now = world.now + 86400
+        SlashCmdList.TRADINGESSENTIALS("scan")
+    end
+    eq(ns.Market.GetUsualPrice(1001), 100, "three days at 100")
+    eq(ns.Market.GetUsualPrice(1002), nil, "never seen")
+
+    local _, list = openShopping(ns)
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 200, 5 } })
+    eq(textShowing("Dearer than usual: +100.0%") ~= nil, true, tostring(textShowing("Dearer")))
+    press(BUY)
+    eq(#world.purchaseSteps, 0, "one more press")
+    press(BUY)
+    eq(world.purchaseSteps[1], "start 1001 x1")
+end)
+
+test("the most profitable recipes come first", function()
+    local auctionator = fakeAuctionator({ [1001] = 100, [5001] = 1000, [5002] = 150 }, {})
+    local ns, world = Mock.Boot({ auctionator = auctionator })
+    remember(ns)
+    trackRecipe(world, 11, "Small margin", 5002, { { 1001, 1 } })
+    trackRecipe(world, 12, "Large margin", 5001, { { 1001, 1 } })
+    trackRecipe(world, 13, "Unknown margin", 5003, { { 1002, 1 } })
+    local recipes = openShopping(ns)
+    local names = {}
+    for _, recipe in ipairs(recipes.rows) do
+        table.insert(names, recipe.name)
+    end
+    eq(table.concat(names, ","), "Large margin,Small margin,Unknown margin")
+end)
+
+test("a purchase that fails or has no price looks again, and leaving cancels it", function()
+    local ns, world = Mock.Boot({ money = 1000000 })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 2 }, { 1002, 2 } })
+    local _, list = openShopping(ns)
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 100, 30 } })
+    local searches = #world.searches
+    press(BUY)
+    Mock.Fire("COMMODITY_PRICE_UNAVAILABLE")
+    eq(world.purchaseSteps[2], "cancel")
+    eq(#world.searches, searches + 1, "searches again")
+
+    answerCommodity(world, 1001, { { 100, 30 } })
+    press(BUY)
+    Mock.Fire("COMMODITY_PRICE_UPDATED", 100, 200)
+    press(BUY)
+    Mock.Fire("COMMODITY_PURCHASE_FAILED")
+    eq(selectedRow(list), "Herb", "stays on it")
+    eq(#world.searches, searches + 2)
+
+    answerCommodity(world, 1001, { { 100, 30 } })
+    press(BUY)
+    local steps = #world.purchaseSteps
+    clickRow(list, "Ore")
+    eq(world.purchaseSteps[steps + 1], "cancel", "choosing another component")
+
+    answerCommodity(world, 1002, { { 100, 30 } })
+    press(BUY)
+    steps = #world.purchaseSteps
+    click(AuctionHouseFrame.Tabs[1])
+    eq(world.purchaseSteps[steps + 1], "cancel", "leaving the view")
+end)
+
+test("changing the quantity once priced drops that price, so Confirm never buys another quantity", function()
+    local ns, world = Mock.Boot({ money = 1000000 })
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 5 } })
+    local _, list = openShopping(ns)
+    local _, quantity = shoppingBoxes()
+    clickRow(list, "Herb")
+    answerCommodity(world, 1001, { { 100, 30 } })
+    press(BUY)
+    Mock.Fire("COMMODITY_PRICE_UPDATED", 100, 500)
+    eq(rawget(_G, BUY):GetText(), "Confirm")
+
+    quantity:SetText("3")
+    quantity.scripts.OnTextChanged(quantity, true)
+    eq(world.purchaseSteps[2], "cancel", "the game forgets the priced purchase")
+    eq(rawget(_G, BUY):GetText(), "Buy")
+    eq(textShowing("Exact total"), nil)
+    press(BUY)
+    eq(world.purchaseSteps[3], "start 1001 x3", "priced again for the new quantity")
+end)
+
+test("a recraft makes no new units: it covers no component and suggests no crafts", function()
+    local ns, world = Mock.Boot()
+    remember(ns)
+    ns.Ledger.Add({ kind = "sold", itemID = 5001, name = "Flask", qty = 20, gross = 100, t = world.now - 86400 })
+    trackRecipe(world, 11, "Make cauldron", 5002, { { 5001, 2 } })
+    trackRecipe(world, 12, "Recraft flask", 5001, { { 1001, 1 } }, { recraft = true })
+    local recipes, list = openShopping(ns)
+    eq(listText(list), "Flask=2/0/2,Herb=1/0/1", "the recraft does not make the flasks the cauldron needs")
+    for _, recipe in ipairs(recipes.rows) do
+        eq(recipe.suggested, nil, recipe.name)
+    end
+end)
+
+test("the list follows what is tracked and loads the items it does not know yet", function()
+    local ns, world = Mock.Boot()
+    remember(ns)
+    world.unloadedItems[1002] = true
+    trackRecipe(world, 11, "Make flask", 5001, { { 1002, 1 } })
+    local recipes, list = openShopping(ns)
+    eq(world.itemLoads[1002], true, "asked for")
+    trackRecipe(world, 12, "Another", 5002, { { 1001, 1 } }, { recraft = true })
+    Mock.Fire("TRACKED_RECIPE_UPDATE", 12, true)
+    refreshShopping()
+    eq(#recipes.rows, 2, "a recraft counts")
+    eq(listText(list), "Herb=1/0/1,Ore=1/0/1")
+    eq(TradingEssentialsDB.ui.shoppingCrafts, nil, "nothing saved at one craft")
+    ns.Shopping.SetCrafts("12:recraft", 3)
+    eq(TradingEssentialsDB.ui.shoppingCrafts["12:recraft"], 3, "kept apart from the plain recipe")
+end)
+
+test("what is bought waits in the mail until the mailbox says what it holds", function()
+    local ns, world = Mock.Boot()
+    Mock.Fire("COMMODITY_PURCHASED", 1001, 4)
+    Mock.Fire("COMMODITY_PURCHASED", 1001, 1)
+    Mock.RunTimers()
+    eq(ns.Stockpile.GetItemRow(1001).mail, 5, "whatever made the purchase")
+    world.mails = {}
+    Mock.Fire("MAIL_SHOW")
+    Mock.RunTimers()
+    eq(ns.Stockpile.GetItemRow(1001), nil, "the mailbox has the last word")
+end)
+
+test("the keys buy while the Purchases view shows", function()
+    local ns, world = Mock.Boot()
+    remember(ns)
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 1 } })
+    openShopping(ns)
+    eq(world.bindings.SPACE, "CLICK " .. BUY .. ":LeftButton")
+    eq(world.bindings["SHIFT-SPACE"], "CLICK TradingEssentialsShoppingNext:LeftButton")
+    for _, object in ipairs(Mock.Objects()) do
+        local parent = rawget(object, "parent")
+        if object.kind == "text" and object.text == "Quick sell" and parent and rawget(parent, "Underline") then
+            click(parent)
+        end
+    end
+    eq(world.bindings.SPACE, "CLICK " .. POST .. ":LeftButton")
+    click(AuctionHouseFrame.Tabs[1])
+    eq(next(world.bindings), nil)
+end)
+
+-- Profit and how items sell ------------------------------------------------------------
+
+-- Five items, one for each kind of advice, and one with nothing to say.
+local function seedProfit(ns, world)
+    local now = world.now
+    local function add(entry)
+        ns.Ledger.Add(entry)
+    end
+    -- Herb: bought at 100 each, 6 of 10 sold six hours after listing.
+    add({ kind = "bought", t = now - 86400, itemID = 1001, name = "Herb", qty = 10, gross = 1000 })
+    add({ kind = "post", t = now - 10 * 3600, itemID = 1001, name = "Herb", qty = 10, deposit = 50 })
+    add({ kind = "sold", t = now - 4 * 3600, itemID = 1001, name = "Herb", qty = 6, gross = 1200, cut = 60, deposit = 30 })
+    add({ kind = "expired", t = now - 3600, itemID = 1001, name = "Herb", qty = 4 })
+    -- Ore: listed, never sold.
+    add({ kind = "post", t = now - 50 * 3600, itemID = 1002, name = "Ore", qty = 5, deposit = 100 })
+    add({ kind = "expired", t = now - 2 * 3600, itemID = 1002, name = "Ore", qty = 5 })
+    -- Gem: one of ten sold, and three days after its listing, too long to be that listing's.
+    add({ kind = "post", t = now - 80 * 3600, itemID = 1003, name = "Gem", qty = 10, deposit = 10 })
+    add({ kind = "sold", t = now - 3600, itemID = 1003, name = "Gem", qty = 1, gross = 1000, cut = 50, deposit = 1 })
+    add({ kind = "expired", t = now - 3600, itemID = 1003, name = "Gem", qty = 9 })
+    -- Flask: crafted from two herbs, sold below that.
+    add({ kind = "sold", t = now - 3600, itemID = 5001, name = "Flask", qty = 1, gross = 300, cut = 15 })
+    -- Soul dust: everything listed sold.
+    add({ kind = "post", t = now - 3 * 3600, itemID = 6001, name = "Soul dust", qty = 4, deposit = 4 })
+    add({ kind = "sold", t = now - 2 * 3600, itemID = 6001, name = "Soul dust", qty = 4, gross = 400, cut = 20, deposit = 4 })
+    trackRecipe(world, 11, "Make flask", 5001, { { 1001, 2 } })
+end
+
+test("an item's profit takes off the cut, the lost fees and what it cost to buy or craft", function()
+    local ns, world = Mock.Boot()
+    seedProfit(ns, world)
+    local items = ns.Profit.Analyze({ since = ns.Stats.PeriodStart(7) })
+
+    local herb = items[1001]
+    eq(herb.proceeds, 1140, "after the cut")
+    eq(herb.feesLost, 20, "the deposit not refunded")
+    eq(herb.costSource, "bought")
+    eq(herb.unitCost, 100)
+    eq(herb.profit, 1140 - 20 - 600)
+    near(herb.unitProfit, 520 / 6, 0.001)
+    eq(herb.sellThrough, 0.6)
+    eq(herb.timeToSell, 6 * 3600)
+    eq(herb.advice, nil, "nothing to say")
+
+    local flask = items[5001]
+    eq(flask.costSource, "crafted")
+    eq(flask.unitCost, 400, "two herbs at their average sale of 200")
+    eq(flask.profit, 285 - 400)
+    eq(flask.advice, "loss")
+    eq(flask.timeToSell, nil, "never listed here")
+
+    eq(items[1002].advice, "unsold")
+    eq(items[1002].profit, -100, "the deposit is lost")
+    eq(items[1003].advice, "slow")
+    eq(items[1003].costSource, nil, "neither bought nor crafted: counted as free")
+    eq(items[1003].timeToSell, nil, "no listing an auction could have lasted from")
+    eq(items[6001].advice, "good")
+    eq(ns.Profit.Total(items), 520 - 100 + 950 - 9 - 115 + 380)
+end)
+
+test("the Stats tab shows what each item earned and how it sells, with advice", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    local values = {}
+    local createTile = ns.UI.CreateTile
+    ns.UI.CreateTile = function(parent, spec, width)
+        local tile = createTile(parent, spec, width)
+        local setValue = tile.SetValue
+        tile.SetValue = function(self, text, color)
+            values[spec.key] = text
+            setValue(self, text, color)
+        end
+        return tile
+    end
+    seedProfit(ns, world)
+    ns.UI.Open("stats")
+    eq(values.profit, ns.FormatSignedMoney(1626), "the profit tile")
+
+    local list = tables[1]
+    eq(list.rows[1].itemID, 1003, "the most profitable first")
+    local texts = renderedTexts(list)
+    local function rowText(name)
+        for _, text in ipairs(texts) do
+            if has(text, name) then
+                return text
+            end
+        end
+    end
+    eq(has(rowText("Ore") or "", "Unsold"), true, "an item that only lost its deposits is listed, with advice")
+    eq(has(rowText("Herb") or "", "60.0%|6 h"), true, rowText("Herb"))
+    eq(has(rowText("Soul dust") or "", "Good"), true, rowText("Soul dust"))
+
+    for _, row in ipairs(list.ScrollBox.rendered) do
+        if row.data.itemID == 1003 then
+            GameTooltip.lines = {}
+            row.scripts.OnEnter(row)
+        end
+    end
+    local lines = table.concat(GameTooltip.lines, ";")
+    eq(has(lines, "Unit cost=Free: neither bought nor crafted"), true, lines)
+    eq(has(lines, "Rarely sells"), true, lines)
+end)
+
+test("item tooltips give the profit per unit, how much sells and how fast, with advice", function()
+    local ns, world = Mock.Boot()
+    seedProfit(ns, world)
+    local text = hoverItem(1001)
+    eq(has(text, "Profit per unit (90 days)=+87c"), true, text)
+    eq(has(text, "Sold %=60.0%"), true, text)
+    eq(has(text, "Time to sell=6 h"), true, text)
+    text = hoverItem(1002)
+    eq(has(text, "Did not sell in this period"), true, text)
+    ns.Ledger.Add({ kind = "sold", t = world.now, itemID = 1002, name = "Ore", qty = 5, gross = 5000, cut = 250 })
+    eq(has(hoverItem(1002), "Did not sell"), false, "follows the ledger")
+end)
+
+layoutTest("layout: the shopping list fits its labels, columns and buttons", function()
+    local ns, world = layoutFixture()
+    ns.RememberItem(7001, "An item with a really very long name indeed", 3, 1)
+    ns.RememberItem(7002, "Another item with a really very long name", 3, 1)
+    trackRecipe(world, 11, "A recipe with a really very long name indeed", 7050, { { 7001, 2 }, { 7002, 2000 } })
+    local recipes, list = openShopping(ns)
+    clickRow(list, "An item with a really very long name indeed")
+    answerCommodity(world, 7001, { { 100000, 1 }, { 99990000, 500 } })
+
+    local root = rawget(rawget(_G, BUY), "parent")
+    local rootRect = Mock.Rect(root)
+    local strip = {}
+    for _, object in ipairs(Mock.Objects()) do
+        if object.kind == "text" and rawget(object, "parent") == root and Mock.IsVisible(object) and object.text ~= "" then
+            local rect = Mock.Rect(object)
+            eq(rect.left >= rootRect.left and rect.right <= rootRect.right + 0.01, true, "outside: " .. describe(object, rect))
+            table.insert(strip, { object = object, rect = rect })
+        end
+    end
+    for i = 1, #strip do
+        for j = i + 1, #strip do
+            eq(overlap(strip[i].rect, strip[j].rect), false,
+                "overlap: " .. describe(strip[i].object, strip[i].rect) .. " and " .. describe(strip[j].object, strip[j].rect))
+        end
+    end
+    for _, item in ipairs(strip) do
+        if item.object.font == "GameFontNormalSmall" then
+            eq(item.object:GetStringWidth() <= item.rect.right - item.rect.left + 0.01, true, ("label cut: %q"):format(item.object.text))
+        end
+    end
+
+    for _, tbl in ipairs({ recipes, list }) do
+        local box = Mock.Rect(tbl.ScrollBox)
+        for _, column in ipairs(tbl.columns) do
+            local header, title = Mock.Rect(column.header), Mock.Rect(column.header.Text)
+            eq(header.right <= box.right - 2, true, ("column %s runs into the scroll bar"):format(column.key))
+            eq(title.left >= header.left - 0.01 and title.right <= header.right + 0.01, true,
+                ("title too wide for column %s: %q"):format(column.key, column.header.Text:GetText()))
+        end
+    end
+
+    for _, object in ipairs(Mock.Objects()) do
+        if object.template == "UIPanelButtonTemplate" and Mock.IsWithin(object, rawget(root, "parent"))
+            and Mock.IsVisible(object) and object.text ~= "" then
+            eq(object:GetStringWidth() <= object.width - 12, true, "button text: " .. object.text)
+        end
+    end
+end)
+
+-- Settings ---------------------------------------------------------------------
+
+local function scaleControls()
+    return Mock.SettingsControl("Custom window scale"), Mock.SettingsControl("Window scale")
+end
+
+-- Where the window's centre is on the screen, whatever its scale.
+local function screenCenter(frame)
+    local x, y = frame:GetCenter()
+    local scale = frame:GetEffectiveScale()
+    return x * scale, y * scale
+end
+
+local SETTING_NAMES = {
+    "Minimap icon", "Item tooltips", "Mail summary", "Sale duration", "Proposed price",
+    "Next item after posting", "Trading Essentials tab keys", "Stock counted for purchases",
+    "Component quality", "Custom window scale", "Window scale",
+}
+
+test("the add-on has a page of its own in the game's options, with every setting", function()
+    Mock.Boot()
+    local page = Mock.SettingsPage()
+    eq(page ~= nil, true, "registered among the add-ons")
+    eq(page.name, "Trading Essentials")
+    eq(page.frame.OnRefresh ~= nil and page.frame.OnDefault ~= nil, true, "the panel can refresh and reset it")
+    local kinds, previousTop = {}, math.huge
+    for _, name in ipairs(SETTING_NAMES) do
+        local control = Mock.SettingsControl(name)
+        table.insert(kinds, control.kind)
+        local top = Mock.Rect(control.row).top
+        eq(top < previousTop, true, "in order: " .. name)
+        previousTop = top
+        control.row.scripts.OnEnter(control.row)
+        eq(GameTooltip:GetText(), name, "hovering names it")
+        eq(#GameTooltip.lines > 0, true, "and explains it: " .. name)
+        GameTooltip.lines = {}
+    end
+    eq(table.concat(kinds, ","), "checkbox,checkbox,checkbox,dropdown,dropdown,checkbox,checkbox,"
+        .. "dropdown,dropdown,checkbox,slider")
+
+    local _, slider = scaleControls()
+    eq(slider.widget.minValue, 50)
+    eq(slider.widget.maxValue, 120)
+    eq(slider.widget.steps, 14, "steps of 5%")
+    eq(slider.widget.formatters[MinimalSliderWithSteppersMixin.Label.Right](85), "85%")
+    eq(Mock.Rect(slider.label).left > Mock.Rect(Mock.SettingsControl("Custom window scale").label).left, true,
+        "indented under the checkbox it depends on")
+end)
+
+test("the settings page uses none of the game's settings objects, which would taint its actions", function()
+    Mock.Boot()
+    for key in pairs(Settings) do
+        eq(key == "RegisterCanvasLayoutCategory" or key == "RegisterAddOnCategory" or key == "OpenToCategory",
+            true, "only the canvas page: " .. key)
+    end
+end)
+
+test("right-clicking the icon or the add-on menu entry opens the settings", function()
+    local _, world = Mock.Boot()
+    local id = Mock.SettingsPage():GetID()
+    local button = TradingEssentialsMinimapButton
+    button.scripts.OnClick(button, "RightButton")
+    eq(world.openedSettings, id, "from the icon")
+    eq(TradingEssentialsMainFrame, nil, "without opening the window")
+
+    world.openedSettings = nil
+    TradingEssentials_OnAddonCompartmentClick("TradingEssentials", "RightButton")
+    eq(world.openedSettings, id, "from the add-on menu")
+    TradingEssentials_OnAddonCompartmentClick("TradingEssentials", "LeftButton")
+    eq(TradingEssentialsMainFrame:IsShown(), true, "a left click still opens the window")
+
+    world.openedSettings = nil
+    SlashCmdList.TRADINGESSENTIALS("settings")
+    eq(world.openedSettings, id, "from the slash command")
+end)
+
+test("the minimap and tooltip settings agree with the slash commands", function()
+    local ns, world = Mock.Boot()
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 100 })
+    local minimap = Mock.SettingsControl("Minimap icon").setting
+    local tooltip = Mock.SettingsControl("Item tooltips").setting
+    eq(minimap:GetValue(), true)
+    eq(tooltip:GetValue(), true)
+
+    minimap:SetValue(false)
+    eq(TradingEssentialsMinimapButton:IsShown(), false, "the icon hides")
+    tooltip:SetValue(false)
+    eq(hoverItem(1001), "", "the tooltip lines go")
+    eq(#world.printed, 0, "quietly, the panel shows it")
+
+    SlashCmdList.TRADINGESSENTIALS("minimap")
+    SlashCmdList.TRADINGESSENTIALS("tooltip")
+    eq(minimap:GetValue(), true, "the slash command shows in the settings")
+    eq(tooltip:GetValue(), true)
+    eq(TradingEssentialsMinimapButton:IsShown(), true)
+    eq(has(hoverItem(1001), "Last sale"), true)
+
+    minimap:SetValue(false)
+    Mock.Boot({ db = TradingEssentialsDB })
+    eq(Mock.SettingsControl("Minimap icon").setting:GetValue(), false, "kept across a reload")
+    eq(TradingEssentialsMinimapButton:IsShown(), false)
+end)
+
+test("the window follows the game's UI scale until it has a scale of its own", function()
+    Mock.Boot()
+    UIParent:SetScale(0.8)
+    SlashCmdList.TRADINGESSENTIALS("")
+    local frame = TradingEssentialsMainFrame
+    local custom, slider = scaleControls()
+    near(frame:GetEffectiveScale(), 0.8, 0.0001, "the game's scale")
+    eq(custom.setting:GetValue(), false)
+    eq(Mock.IsControlEnabled(slider), false, "slider greyed out")
+    eq(slider.setting:GetValue(), 80, "the slider shows the game's scale")
+
+    custom.setting:SetValue(true)
+    near(frame:GetEffectiveScale(), 0.8, 0.0001, "turning it on changes nothing yet")
+    eq(Mock.IsControlEnabled(slider), true, "slider usable")
+
+    slider.setting:SetValue(110)
+    near(frame:GetEffectiveScale(), 1.1, 0.0001, "the window's own scale")
+
+    UIParent:SetScale(0.6)
+    Mock.Fire("UI_SCALE_CHANGED")
+    near(frame:GetEffectiveScale(), 1.1, 0.0001, "kept when the game's scale changes")
+    eq(slider.setting:GetValue(), 110)
+
+    custom.setting:SetValue(false)
+    near(frame:GetEffectiveScale(), 0.6, 0.0001, "the game's scale again")
+    eq(TradingEssentialsDB.ui.scale, nil)
+end)
+
+test("a scale of its own starts from the game's, on the slider's steps and range", function()
+    Mock.Boot()
+    local custom, slider = scaleControls()
+    for _, case in ipairs({ { 0.71, 70 }, { 0.73, 75 }, { 0.4, 50 }, { 1.5, 120 } }) do
+        UIParent:SetScale(case[1])
+        custom.setting:SetValue(true)
+        eq(slider.setting:GetValue(), case[2], "from " .. case[1])
+        near(TradingEssentialsDB.ui.scale, case[2] / 100, 0.0001, "saved from " .. case[1])
+        custom.setting:SetValue(false)
+    end
+end)
+
+test("the scale is set before the window first shows, and kept across a reload", function()
+    Mock.Boot()
+    UIParent:SetScale(0.7)
+    local custom, slider = scaleControls()
+    custom.setting:SetValue(true)
+    slider.setting:SetValue(90)
+    Mock.Fire("UI_SCALE_CHANGED") -- No window yet.
+    SlashCmdList.TRADINGESSENTIALS("")
+    near(TradingEssentialsMainFrame:GetEffectiveScale(), 0.9, 0.0001, "on creation")
+
+    Mock.Boot({ db = TradingEssentialsDB })
+    UIParent:SetScale(0.7)
+    SlashCmdList.TRADINGESSENTIALS("")
+    near(TradingEssentialsMainFrame:GetEffectiveScale(), 0.9, 0.0001, "after a reload")
+    eq(Mock.SettingsControl("Window scale").setting:GetValue(), 90)
+end)
+
+test("changing the scale keeps the window's centre on the same spot of the screen", function()
+    Mock.Boot()
+    UIParent:SetScale(0.8)
+    SlashCmdList.TRADINGESSENTIALS("")
+    local frame = TradingEssentialsMainFrame
+    frame:ClearAllPoints()
+    frame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", 300, 1100)
+    frame.scripts.OnDragStop(frame)
+    local x, y = screenCenter(frame)
+
+    local custom, slider = scaleControls()
+    custom.setting:SetValue(true)
+    slider.setting:SetValue(120)
+    local newX, newY = screenCenter(frame)
+    near(newX, x, 0.01, "x")
+    near(newY, y, 0.01, "y")
+
+    Mock.Boot({ db = TradingEssentialsDB })
+    UIParent:SetScale(0.8)
+    SlashCmdList.TRADINGESSENTIALS("")
+    newX, newY = screenCenter(TradingEssentialsMainFrame)
+    near(newX, x, 0.01, "x after a reload")
+    near(newY, y, 0.01, "y after a reload")
+end)
+
+test("restoring the defaults gives back the game's scale, the icon and the tooltip lines", function()
+    for _, how in ipairs({ "page", "panel" }) do
+        local ns = Mock.Boot()
+        UIParent:SetScale(0.7)
+        local page = Mock.SettingsPage().frame
+        local custom, slider = scaleControls()
+        custom.setting:SetValue(true)
+        slider.setting:SetValue(110)
+        Mock.SettingsControl("Minimap icon").setting:SetValue(false)
+        Mock.SettingsControl("Item tooltips").setting:SetValue(false)
+        Mock.SettingsControl("Sale duration").setting:SetValue(12)
+        ns.UI.MoveInOrder("tabs", "gold", -1)
+
+        if how == "page" then
+            local defaults = frameWithin("UIPanelButtonTemplate", page)
+            eq(defaults:GetText(), "Defaults", "the page's own button")
+            defaults.scripts.OnClick(defaults)
+        else
+            page:OnDefault()
+        end
+        eq(TradingEssentialsDB.ui.scale, nil, "follows the game again, from the " .. how)
+        eq(slider.setting:GetValue(), 70, "the slider shows the game's scale, from the " .. how)
+        eq(Mock.IsControlEnabled(slider), false, "greyed out again, from the " .. how)
+        eq(custom.setting:GetValue(), false)
+        eq(TradingEssentialsMinimapButton:IsShown(), true, "icon, from the " .. how)
+        eq(Mock.SettingsControl("Minimap icon").setting:GetValue(), true, "the page shows it")
+        eq(TradingEssentialsDB.ui.hideItemTooltip, nil, "tooltip lines, from the " .. how)
+        eq(Mock.SettingsControl("Sale duration").setting:GetValue(), 48)
+        eq(TradingEssentialsDB.ui.order, nil, "the order, from the " .. how)
+    end
+end)
+
+layoutTest("layout: the settings fit the page, their labels on two lines at most", function()
+    local ns = Mock.Boot({ locale = layoutLocale })
+    local page = Mock.SettingsPage().frame
+    local bounds = Mock.Rect(page)
+    for _, name in ipairs(SETTING_NAMES) do
+        local control = Mock.SettingsControl(ns.L[name])
+        local label = Mock.Rect(control.label)
+        local widget = Mock.Rect(control.widget)
+        eq(label.right <= widget.left, true, "the label ends before its control: " .. control.label.text)
+        local lines = math.ceil(control.label:GetStringWidth() / (label.right - label.left))
+        eq(lines <= 2, true, ("label on %d lines: %q"):format(lines, control.label.text))
+        eq(widget.right <= bounds.right - 24, true, "the control fits beside the scroll bar: " .. name)
+    end
+    local defaults = frameWithin("UIPanelButtonTemplate", page)
+    eq(defaults:GetStringWidth() <= defaults.width - 12, true, "button text: " .. defaults:GetText())
+end)
+
+test("the slash command opens tabs and explains itself otherwise", function()
+    local ns, world = Mock.Boot()
+    SlashCmdList.TRADINGESSENTIALS("")
+    eq(TradingEssentialsMainFrame:IsShown(), true)
+    SlashCmdList.TRADINGESSENTIALS("stats")
+    SlashCmdList.TRADINGESSENTIALS("STOCK")
+    eq(#world.printed, 0)
+    SlashCmdList.TRADINGESSENTIALS("nonsense")
+    eq(#world.printed, 1)
+    TradingEssentials_OnAddonCompartmentClick()
+end)
+
+test("English needs no translation, and an unknown string falls back to it", function()
+    local ns = Mock.Boot({ locale = "enUS" })
+    eq(ns.Translation, nil)
+    eq(ns.L["Purchases"], "Purchases")
+
+    ns = Mock.Boot({ locale = "frFR" })
+    eq(ns.L["Purchases"], "Achats")
+    eq(ns.L["A string nobody translated"], "A string nobody translated")
+end)
+
+-- The strings the interface asks for, read from the sources listed in the TOC.
+local function interfaceStrings()
+    local keys = {}
+    for line in io.lines("TradingEssentials.toc") do
+        line = line:gsub("%s+$", "")
+        if line ~= "" and line:sub(1, 2) ~= "##" and not line:find("^Locales") then
+            for sourceLine in io.lines((line:gsub("\\", "/"))) do
+                for key in sourceLine:gmatch('L%["(.-)"%]') do
+                    keys[key] = true
+                end
+            end
+        end
+    end
+    return keys
+end
+
+local function placeholders(text)
+    local found = {}
+    for placeholder in text:gmatch("%%[ds]") do
+        table.insert(found, placeholder)
+    end
+    return table.concat(found, " ")
+end
+
+for _, locale in ipairs(LOCALES) do
+    test(locale .. ": every interface string is translated, with the same placeholders", function()
+        local ns = Mock.Boot({ locale = locale })
+        local keys = interfaceStrings()
+        local problems = {}
+        for key in pairs(keys) do
+            if not ns.Translation[key] then
+                table.insert(problems, "missing: " .. key)
+            end
+        end
+        for key, text in pairs(ns.Translation) do
+            if not keys[key] then
+                table.insert(problems, "unused: " .. key)
+            elseif key ~= "%m/%d" and placeholders(key) ~= placeholders(text) then
+                table.insert(problems, "placeholders: " .. key)
+            end
+        end
+        table.sort(problems)
+        eq(table.concat(problems, "; "), "")
+    end)
+end
+
+test("the icon is a texture the client can read, used by the add-on list too", function()
+    local ns = Mock.Boot()
+    local path = ns.ICON:match("^Interface\\AddOns\\TradingEssentials\\(.+)$")
+    eq(path ~= nil, true, "inside the addon folder: " .. ns.ICON)
+    local file = assert(io.open(path:gsub("\\", "/") .. ".tga", "rb"), "Media/Icon.tga is missing")
+    local header = file:read(18)
+    file:close()
+    local function isPowerOfTwo(n)
+        while n > 1 and n % 2 == 0 do
+            n = n / 2
+        end
+        return n == 1
+    end
+    local width = header:byte(13) + 256 * header:byte(14)
+    local height = header:byte(15) + 256 * header:byte(16)
+    eq(header:byte(3), 2, "uncompressed true color")
+    eq(header:byte(17), 32, "32 bits, with alpha")
+    eq(isPowerOfTwo(width) and isPowerOfTwo(height), true, "sides a power of two")
+    local iconTexture
+    for line in io.lines("TradingEssentials.toc") do
+        iconTexture = iconTexture or line:match("^## IconTexture: (%S+)")
+    end
+    eq(iconTexture, ns.ICON)
+end)
+
+test("the add-on list has a description and a category in every language", function()
+    local lines = {}
+    for line in io.lines("TradingEssentials.toc") do
+        lines[line:match("^## ([^:]+):") or ""] = true
+    end
+    for _, locale in ipairs(LOCALES) do
+        eq(lines["Notes-" .. locale], true, "description in " .. locale)
+        eq(lines["Category-" .. locale], true, "category in " .. locale)
+    end
+end)
+
+test("dates follow the order of the language", function()
+    -- The clock of the fake client reads 5 November.
+    local expected = {
+        enUS = "11/05", enGB = "05/11", deDE = "05.11.", esES = "05/11", esMX = "05/11", frFR = "05/11",
+        itIT = "05/11", koKR = "11/05", ptBR = "05/11", ruRU = "05.11", zhCN = "11/05", zhTW = "11/05",
+    }
+    for locale, day in pairs(expected) do
+        local ns, world = Mock.Boot({ locale = locale })
+        eq(ns.FormatDay(world.now), day, locale)
+        eq(ns.FormatDate(world.now), day .. " 12:00", locale)
+    end
+end)
+
+test("money formatting drops the small coins beside larger amounts", function()
+    local ns = Mock.Boot()
+    eq(ns.FormatMoney(nil), "-")
+    eq(ns.FormatMoney(0), "0c")
+    eq(ns.FormatMoney(9999), "9999c", "under a gold piece: as is")
+    eq(ns.FormatMoney(12345), "12300c", "from a gold piece: to the silver")
+    eq(ns.FormatMoney(-12345), "-12300c")
+    eq(ns.FormatMoney(1234567), "1230000c", "from 100 gold: to the gold")
+    eq(ns.FormatMoney(33.4), "33c", "averages are rounded")
+    eq(ns.FormatSignedMoney(5), "+5c")
+    eq(ns.FormatSignedMoney(-5), "-5c")
+end)
+
+test("exact money keeps every coin, for checking against an invoice", function()
+    local ns = Mock.Boot()
+    eq(ns.FormatExactMoney(nil), "-")
+    eq(ns.FormatExactMoney(1234567), "1234567c")
+    eq(ns.FormatExactMoney(-1234567), "-1234567c")
+    eq(ns.FormatExactMoney(33.4), "33c")
+end)
+
+test("tooltips show exact amounts while the tables stay compact", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    ns.Ledger.Add({ kind = "sold", itemID = 1001, name = "Herb", qty = 1, gross = 1234567, cut = 61728, deposit = 0 })
+    ns.UI.Open("auctions")
+    local row = tables[1].ScrollBox.rendered[1]
+    eq(row.cells[6].text, "+1170000c", "compact in the table")
+    row.scripts.OnEnter(row)
+    local lines = table.concat(GameTooltip.lines, ";")
+    eq(lines:find("Sale price=1234567c", 1, true) ~= nil, true, "exact in the tooltip: " .. lines)
+    eq(lines:find("Auction house cut=-61728c", 1, true) ~= nil, true, "exact cut")
+end)
+
+test("the sort arrow marks the sorted column, and flips with the direction", function()
+    local ns, world = Mock.Boot()
+    local tables = captureTables(ns)
+    seedLedger(ns, world)
+    ns.UI.Open("auctions")
+    local list = tables[1]
+    local amount, date_ = list.columns[6], list.columns[1]
+    eq(date_.header.Arrow:IsShown(), true, "default column")
+    eq(amount.header.Arrow:IsShown(), false)
+    eq(date_.header.Arrow.atlas, "auctionhouse-ui-sortarrow")
+
+    amount.header.scripts.OnClick(amount.header)
+    eq(amount.header.Arrow:IsShown(), true, "moved")
+    eq(date_.header.Arrow:IsShown(), false, "moved")
+    local before = amount.header.Arrow.texCoord[3]
+    amount.header.scripts.OnClick(amount.header)
+    eq(amount.header.Arrow.texCoord[3] ~= before, true, "flipped")
+end)
+
+layoutTest("the sort arrow sits beside its title without covering it", function()
+    local ns, world = Mock.Boot({ locale = layoutLocale })
+    local tables = captureTables(ns)
+    ns.UI.Open("stock")
+    for _, column in ipairs(tables[1].columns) do
+        local arrow = Mock.Rect(column.header.Arrow)
+        local title = Mock.Rect(column.header.Text)
+        if column.align == "RIGHT" then
+            eq(arrow.right <= title.left, true, column.key .. ": left of a right-aligned title")
+        else
+            eq(arrow.left >= title.right, true, column.key .. ": right of a left-aligned title")
+        end
+    end
+end)
+
+layoutTest("table rows line up with their headers, on every tab", function()
+    local ns, world = layoutFixture()
+    local tables = captureTables(ns)
+    for _, tab in ipairs({ "auctions", "stock", "stats", "gold" }) do
+        ns.UI.Open(tab)
+    end
+    eq(#tables, 4)
+    for index, tbl in ipairs(tables) do
+        local row = tbl.ScrollBox.rendered[1]
+        eq(row ~= nil, true, "table " .. index .. " has rows")
+        for columnIndex, column in ipairs(tbl.columns) do
+            local header = Mock.Rect(column.header)
+            local cell = Mock.Rect(row.cells[columnIndex])
+            if column.item or column.marker then
+                eq(cell.right, header.right, ("table %d, %s: right edge"):format(index, column.key))
+            else
+                eq(cell.left, header.left, ("table %d, %s: left edge"):format(index, column.key))
+                eq(cell.right, header.right, ("table %d, %s: right edge"):format(index, column.key))
+            end
+        end
+    end
+end)
+
+test("the margins are generous enough to breathe", function()
+    local ns = Mock.Boot()
+    eq(ns.UI.PADDING >= 12, true, "window padding")
+    eq(ns.UI.GAP >= 10, true, "gap between blocks")
+end)
+
+-- Runner --------------------------------------------------------------------
+
+local failures = {}
+for _, t in ipairs(tests) do
+    local ok, err = xpcall(t.fn, function(message)
+        return debug.traceback(tostring(message), 2)
+    end)
+    if ok then
+        passed = passed + 1
+    else
+        failed = failed + 1
+        table.insert(failures, "FAIL  " .. t.name .. "\n      " .. tostring(err):gsub("\n", "\n      "))
+    end
+end
+
+setmetatable(_G, nil)
+for _, failure in ipairs(failures) do
+    output(failure)
+    output("")
+end
+output(("%d passed, %d failed"):format(passed, failed))
+
+return failed
